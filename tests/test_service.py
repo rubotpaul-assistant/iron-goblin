@@ -85,6 +85,26 @@ def test_logging_respects_increment_and_progression(service: GymService) -> None
     assert result["sync_pending"] is True
 
 
+def test_logging_preserves_independent_weight_for_each_set(service: GymService) -> None:
+    """Warm-up or ramping sets retain their actual loads."""
+    service.begin_workout()
+    result = service.log_exercise(
+        "vertical legs",
+        (Decimal(40), Decimal(40), Decimal(60)),
+        (5, 5, 5),
+    )
+    with service.database.connect() as connection:
+        weights = connection.execute(
+            """SELECT s.weight FROM sets s
+            JOIN workout_exercises wx ON wx.id=s.workout_exercise_id
+            JOIN exercises e ON e.id=wx.exercise_id
+            WHERE e.canonical_name='vertical legs' ORDER BY s.set_number"""
+        ).fetchall()
+    assert [row["weight"] for row in weights] == [40, 40, 60]
+    assert result["set_weights"] == [40, 40, 60]
+    assert result["next_weight"] == 60
+
+
 def test_aliases_resolve_consistently(service: GymService) -> None:
     service.add_alias("pushy up thing", "vertical push")
     assert (

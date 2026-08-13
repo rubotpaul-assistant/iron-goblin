@@ -93,3 +93,42 @@ def test_cli_rejects_invalid_reps(
     )
     assert result.exit_code == 1
     assert "three" in json.loads(result.stdout)["error"]
+
+
+def test_cli_accepts_three_set_weights(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The JSON CLI accepts a distinct load for every set."""
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            app,
+            [
+                "exercise",
+                "add",
+                "squat",
+                "--category",
+                "legs",
+                "--orientation",
+                "vertical",
+                "--equipment-type",
+                "barbell",
+            ],
+        ).exit_code
+        == 0
+    )
+    assert runner.invoke(app, ["workout", "begin"]).exit_code == 0
+    result = runner.invoke(
+        app,
+        [
+            "log",
+            "exercise",
+            "--exercise",
+            "squat",
+            "--weights",
+            "45,45,65",
+            "--reps",
+            "5,5,5",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["set_weights"] == [45.0, 45.0, 65.0]

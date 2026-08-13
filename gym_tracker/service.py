@@ -173,7 +173,7 @@ class GymService:
     def log_exercise(
         self,
         exercise: str,
-        weight: Decimal,
+        weight: Decimal | tuple[Decimal, Decimal, Decimal],
         reps: tuple[int, int, int],
         unit: str = "lb",
         final_rir: int | None = None,
@@ -182,14 +182,17 @@ class GymService:
         """Atomically attach a three-set result to the active workout."""
         if any(repetition < 0 for repetition in reps) or (final_rir is not None and final_rir < 0):
             raise GymError("reps and RIR must be non-negative")
+        set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
         with self.database.connect() as connection:
             workout_exercise = self._active_workout_exercise(connection, exercise)
             equipment = self._equipment_for_exercise(
                 connection, int(workout_exercise["exercise_id"])
             )
-            if equipment and not equipment.contains(weight):
+            if equipment and any(not equipment.contains(set_weight) for set_weight in set_weights):
                 raise GymError("weight is not supported by the required equipment")
-            for set_number, completed_reps in enumerate(reps, start=1):
+            for set_number, (completed_reps, set_weight) in enumerate(
+                zip(reps, set_weights, strict=True), start=1
+            ):
                 connection.execute(
                     """INSERT INTO sets(
                     workout_exercise_id,set_number,completed_reps,weight,unit,rir,technical_failure)
@@ -200,7 +203,7 @@ class GymService:
                         workout_exercise["id"],
                         set_number,
                         completed_reps,
-                        float(weight),
+                        float(set_weight),
                         unit,
                         final_rir if set_number == 3 else None,
                         int(technical_failure and set_number == 3),
@@ -210,16 +213,18 @@ class GymService:
                 "UPDATE workout_exercises SET status='completed' WHERE id=?",
                 (workout_exercise["id"],),
             )
-            next_weight, reason = (weight, "baseline_recorded")
+            working_weight = set_weights[-1]
+            next_weight, reason = (working_weight, "baseline_recorded")
             if equipment:
                 next_weight, reason = progression_weight(
-                    weight, Performance(reps, final_rir, technical_failure), equipment
+                    working_weight, Performance(reps, final_rir, technical_failure), equipment
                 )
             connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
         return {
             "ok": True,
             "exercise": exercise,
             "total_reps": sum(reps),
+            "set_weights": [float(set_weight) for set_weight in set_weights],
             "next_weight": float(next_weight),
             "unit": unit,
             "reason_code": reason,

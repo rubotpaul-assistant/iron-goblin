@@ -78,8 +78,9 @@ def workout_skip() -> None:
 @log_app.command("exercise")
 def log_exercise(
     exercise: Annotated[str, typer.Option("--exercise")],
-    weight: Annotated[str, typer.Option("--weight")],
     reps: Annotated[str, typer.Option("--reps")],
+    weight: Annotated[str | None, typer.Option("--weight")] = None,
+    weights: Annotated[str | None, typer.Option("--weights")] = None,
     unit: Annotated[str, typer.Option("--unit")] = "lb",
     final_set_rir: Annotated[int | None, typer.Option("--final-set-rir")] = None,
     technical_failure: Annotated[bool, typer.Option("--technical-failure")] = False,
@@ -93,10 +94,27 @@ def log_exercise(
     if len(parsed) != 3:
         _run(lambda: (_ for _ in ()).throw(GymError("reps must contain exactly three sets")))
         return
+    if (weight is None) == (weights is None):
+        _run(
+            lambda: (_ for _ in ()).throw(GymError("provide exactly one of --weight or --weights"))
+        )
+        return
+    try:
+        parsed_weight: Decimal | tuple[Decimal, Decimal, Decimal]
+        if weights is None:
+            parsed_weight = Decimal(weight or "")
+        else:
+            weight_values = tuple(Decimal(value.strip()) for value in weights.split(","))
+            if len(weight_values) != 3:
+                raise GymError("weights must contain exactly three values")
+            parsed_weight = weight_values
+    except InvalidOperation as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("weights must be numeric")))
+        raise AssertionError from error
     _run(
         _service().log_exercise,
         exercise,
-        Decimal(weight),
+        parsed_weight,
         parsed,
         unit,
         final_set_rir,
