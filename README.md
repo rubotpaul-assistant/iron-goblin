@@ -6,6 +6,8 @@ Deterministic workout tracking for OpenClaw:
 
 SQLite owns workout state and rules. Sheets is a derived presentation/backup layer. The OpenClaw
 skill translates conversation into structured CLI calls; it never calculates or mutates state.
+The companion `iron-goblin` OpenClaw skill is managed through Skill Workshop rather than installed
+from this repository.
 
 ## Development
 
