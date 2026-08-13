@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from importlib import import_module
 from json import JSONDecodeError, loads
 from os import getenv
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from gym_tracker.db import Database
@@ -102,16 +103,18 @@ class GoogleSheetsWriter:
         service_account_json = getenv("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON")
         if not service_account_json:
             raise ValueError("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON is not configured")
+        service_account = import_module("google.oauth2.service_account")
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        credential_path = Path(service_account_json)
+        if credential_path.is_file():
+            credentials_factory = cast("Any", service_account.Credentials.from_service_account_file)
+            return credentials_factory(credential_path, scopes=scopes)
         try:
             service_account_info = loads(service_account_json)
         except JSONDecodeError as error:
             raise ValueError("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON is not valid JSON") from error
-        service_account = import_module("google.oauth2.service_account")
         credentials_factory = cast("Any", service_account.Credentials.from_service_account_info)
-        return credentials_factory(
-            service_account_info,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        )
+        return credentials_factory(service_account_info, scopes=scopes)
 
     @staticmethod
     def _ensure_tab(service: Any, spreadsheet_id: str, tab: str) -> None:

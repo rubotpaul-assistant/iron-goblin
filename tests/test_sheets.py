@@ -109,3 +109,33 @@ def test_google_writer_requires_service_account_json(monkeypatch: pytest.MonkeyP
     monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON", raising=False)
     with pytest.raises(ValueError, match="GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON"):
         GoogleSheetsWriter().replace_rows("sheet-id", "Workout History", [["header"]])
+
+
+def test_google_writer_accepts_service_account_file_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runtime file reference is delegated to Google's credential loader."""
+    credential_path = tmp_path / "service-account.json"
+    credential_path.touch()
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON", str(credential_path))
+    credentials = object()
+    credentials_factory = MagicMock(return_value=credentials)
+    service_account = MagicMock()
+    service_account.Credentials.from_service_account_file = credentials_factory
+    discovery = MagicMock()
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": "Workout History"}}]
+    }
+    discovery.build.return_value = service
+
+    def fake_import(name: str) -> MagicMock:
+        return service_account if name == "google.oauth2.service_account" else discovery
+
+    with patch("gym_tracker.sheets.import_module", side_effect=fake_import):
+        GoogleSheetsWriter().replace_rows("sheet-id", "Workout History", [["header"]])
+
+    credentials_factory.assert_called_once_with(
+        credential_path,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
