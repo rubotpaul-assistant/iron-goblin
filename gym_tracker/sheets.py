@@ -99,13 +99,13 @@ class GoogleSheetsWriter:
     @staticmethod
     def _credentials() -> Any:
         """Build scoped credentials without logging or persisting secret material."""
-        service_account_json = getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        service_account_json = getenv("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON")
         if not service_account_json:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON is not configured")
         try:
             service_account_info = loads(service_account_json)
         except JSONDecodeError as error:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON") from error
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON is not valid JSON") from error
         service_account = import_module("google.oauth2.service_account")
         credentials_factory = cast("Any", service_account.Credentials.from_service_account_info)
         return credentials_factory(

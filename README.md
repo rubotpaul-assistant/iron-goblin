@@ -18,8 +18,8 @@ uv run pre-commit run --all-files
 ```
 
 Use `GYM_DATABASE_PATH` to override `data/gym.sqlite3`. Sheets sync additionally requires
-`GYM_SPREADSHEET_ID` and Application Default Credentials, normally referenced through
-`GOOGLE_APPLICATION_CREDENTIALS`. Never commit credential material.
+`GYM_SPREADSHEET_ID` and the service-account payload supplied at runtime through
+`GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON`. Never commit credential material.
 
 ## Scheduling
 

@@ -69,7 +69,7 @@ def test_google_writer_uses_service_account_json_and_creates_missing_tab(
 ) -> None:
     """The Google adapter authenticates explicitly and bootstraps its destination tab."""
     monkeypatch.setenv(
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON",
         '{"type":"service_account","client_email":"gym@example.test","private_key":"secret"}',
     )
     credentials = object()
@@ -106,6 +106,6 @@ def test_google_writer_uses_service_account_json_and_creates_missing_tab(
 
 def test_google_writer_requires_service_account_json(monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing credentials fail without falling back to ambient credential discovery."""
-    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
-    with pytest.raises(ValueError, match="GOOGLE_SERVICE_ACCOUNT_JSON"):
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON", raising=False)
+    with pytest.raises(ValueError, match="GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON"):
         GoogleSheetsWriter().replace_rows("sheet-id", "Workout History", [["header"]])
