@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 from importlib import import_module
+from json import JSONDecodeError, loads
+from os import getenv
 from typing import Any, Protocol, cast
 
 from gym_tracker.db import Database
@@ -92,12 +94,45 @@ class SheetsService:
 
 
 class GoogleSheetsWriter:
-    """Lazy Google API adapter; credentials are resolved by Application Default Credentials."""
+    """Google API adapter authenticated from the runtime service-account payload."""
+
+    @staticmethod
+    def _credentials() -> Any:
+        """Build scoped credentials without logging or persisting secret material."""
+        service_account_json = getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if not service_account_json:
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
+        try:
+            service_account_info = loads(service_account_json)
+        except JSONDecodeError as error:
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON") from error
+        service_account = import_module("google.oauth2.service_account")
+        credentials_factory = cast("Any", service_account.Credentials.from_service_account_info)
+        return credentials_factory(
+            service_account_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+
+    @staticmethod
+    def _ensure_tab(service: Any, spreadsheet_id: str, tab: str) -> None:
+        """Create the projection tab when syncing to a new spreadsheet."""
+        metadata = (
+            service.spreadsheets()
+            .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
+            .execute()
+        )
+        titles = {sheet["properties"]["title"] for sheet in metadata.get("sheets", [])}
+        if tab not in titles:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
+            ).execute()
 
     def replace_rows(self, spreadsheet_id: str, tab: str, rows: list[list[Any]]) -> None:
         """Clear and replace a tab through the official API client."""
         build = cast("Any", import_module("googleapiclient.discovery").build)
-        service = build("sheets", "v4", cache_discovery=False)
+        service = build("sheets", "v4", credentials=self._credentials(), cache_discovery=False)
+        self._ensure_tab(service, spreadsheet_id, tab)
         values = service.spreadsheets().values()
         values.clear(spreadsheetId=spreadsheet_id, range=f"'{tab}'").execute()
         values.update(

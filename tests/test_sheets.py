@@ -3,13 +3,14 @@
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gym_tracker.db import Database
 from gym_tracker.domain import Category, Orientation
 from gym_tracker.service import GymService
-from gym_tracker.sheets import SheetsService
+from gym_tracker.sheets import GoogleSheetsWriter, SheetsService
 
 
 class FakeWriter:
@@ -61,3 +62,50 @@ def test_sync_requires_spreadsheet_reference(tmp_path: Path) -> None:
     database.initialize()
     with pytest.raises(ValueError, match="GYM_SPREADSHEET_ID"):
         SheetsService(database, None, FakeWriter()).sync()
+
+
+def test_google_writer_uses_service_account_json_and_creates_missing_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Google adapter authenticates explicitly and bootstraps its destination tab."""
+    monkeypatch.setenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        '{"type":"service_account","client_email":"gym@example.test","private_key":"secret"}',
+    )
+    credentials = object()
+    credentials_factory = MagicMock(return_value=credentials)
+    service = MagicMock()
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": "Sheet1"}}]
+    }
+    build = MagicMock(return_value=service)
+    discovery = MagicMock(build=build)
+    service_account = MagicMock()
+    service_account.Credentials.from_service_account_info = credentials_factory
+
+    def fake_import(name: str) -> MagicMock:
+        return service_account if name == "google.oauth2.service_account" else discovery
+
+    with patch("gym_tracker.sheets.import_module", side_effect=fake_import):
+        GoogleSheetsWriter().replace_rows("sheet-id", "Workout History", [["header"]])
+
+    credentials_factory.assert_called_once_with(
+        {
+            "type": "service_account",
+            "client_email": "gym@example.test",
+            "private_key": "secret",
+        },
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    build.assert_called_once_with("sheets", "v4", credentials=credentials, cache_discovery=False)
+    service.spreadsheets.return_value.batchUpdate.assert_called_once_with(
+        spreadsheetId="sheet-id",
+        body={"requests": [{"addSheet": {"properties": {"title": "Workout History"}}}]},
+    )
+
+
+def test_google_writer_requires_service_account_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing credentials fail without falling back to ambient credential discovery."""
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    with pytest.raises(ValueError, match="GOOGLE_SERVICE_ACCOUNT_JSON"):
+        GoogleSheetsWriter().replace_rows("sheet-id", "Workout History", [["header"]])
