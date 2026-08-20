@@ -39,6 +39,47 @@ def test_history_summary_is_user_scoped_json(
     assert json.loads(result.stdout)["user"] == "geoff"
 
 
+def test_workout_substitute_command_is_exposed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "original push",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "machine",
+        ],
+    )
+    runner.invoke(app, ["workout", "begin"])
+    runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "replacement push",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "dumbbell",
+        ],
+    )
+
+    result = runner.invoke(app, ["workout", "substitute", "--exercise", "replacement push"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["exercise"] == "replacement push"
+
+
 def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
     runner = CliRunner()

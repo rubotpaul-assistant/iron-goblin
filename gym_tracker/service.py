@@ -475,6 +475,51 @@ class GymService:
                 raise GymError("no active workout")
             return self._workout_payload(connection, int(row["id"]), duplicate=False)
 
+    def substitute_exercise(self, exercise: str) -> dict[str, Any]:
+        """Replace an unlogged active prescription with a same-plane/category exercise."""
+        exercise_id = self._exercise_id(exercise)
+        with self.database.connect() as connection:
+            workout = connection.execute(
+                "SELECT id,orientation FROM workout_sessions WHERE status='active'"
+            ).fetchone()
+            if workout is None:
+                raise GymError("no active workout")
+            candidate = connection.execute(
+                """SELECT id,canonical_name,category,orientation,default_unit
+                FROM exercises WHERE id=? AND active=1""",
+                (exercise_id,),
+            ).fetchone()
+            if candidate["orientation"] != workout["orientation"]:
+                raise GymError("substitute must match the active workout orientation")
+            prescribed = connection.execute(
+                """SELECT wx.id,wx.status,e.canonical_name FROM workout_exercises wx
+                JOIN exercises e ON e.id=wx.exercise_id
+                WHERE wx.workout_session_id=? AND e.category=?""",
+                (workout["id"], candidate["category"]),
+            ).fetchone()
+            if prescribed is None:
+                raise GymError("no active prescription for the substitute category")
+            already_logged = connection.execute(
+                "SELECT 1 FROM sets WHERE workout_exercise_id=? LIMIT 1", (prescribed["id"],)
+            ).fetchone()
+            if prescribed["status"] == "completed" or already_logged is not None:
+                raise GymError("cannot substitute a category after results are logged")
+            prescribed_weight, _ = self._prior_prescription(
+                connection, int(workout["id"]), exercise_id
+            )
+            connection.execute(
+                """UPDATE workout_exercises SET exercise_id=?,prescribed_weight=?,unit=?
+                WHERE id=?""",
+                (exercise_id, prescribed_weight, candidate["default_unit"], prescribed["id"]),
+            )
+        return {
+            "ok": True,
+            "workout_id": workout["id"],
+            "replaced": prescribed["canonical_name"],
+            "exercise": candidate["canonical_name"],
+            "category": candidate["category"],
+        }
+
     def log_exercise(
         self,
         exercise: str,

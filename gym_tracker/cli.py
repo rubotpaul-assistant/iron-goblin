@@ -73,6 +73,12 @@ def workout_current() -> None:
     _run(_service().current_workout)
 
 
+@workout_app.command("substitute")
+def workout_substitute(exercise: Annotated[str, typer.Option("--exercise")]) -> None:
+    """Replace an unlogged prescription with a compatible exercise."""
+    _run(_service().substitute_exercise, exercise)
+
+
 @workout_app.command("complete")
 def workout_complete() -> None:
     """Complete a workout after all categories are logged."""

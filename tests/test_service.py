@@ -139,6 +139,29 @@ def test_current_workout_recovers_legacy_null_prescription(service: GymService) 
     assert {item["weight_status"] for item in current["recommendations"]} == {"known"}
 
 
+def test_substitute_replaces_same_category_before_logging(service: GymService) -> None:
+    service.begin_workout()
+    service.add_exercise(
+        "standing dumbbell shoulder press",
+        Category.PUSH,
+        Orientation.VERTICAL,
+        "dumbbell",
+    )
+    result = service.substitute_exercise("standing dumbbell shoulder press")
+    logged = service.log_exercise("standing dumbbell shoulder press", Decimal(20), (5, 5, 5))
+
+    assert result["replaced"] == "vertical push"
+    assert result["exercise"] == "standing dumbbell shoulder press"
+    assert logged["set_weights"] == [20, 20, 20]
+
+
+def test_substitute_rejects_different_orientation(service: GymService) -> None:
+    service.begin_workout()
+
+    with pytest.raises(GymError, match="orientation"):
+        service.substitute_exercise("horizontal push")
+
+
 def test_completion_requires_all_categories(service: GymService) -> None:
     service.begin_workout()
     service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=0)
