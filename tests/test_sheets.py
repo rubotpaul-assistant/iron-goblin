@@ -16,14 +16,13 @@ from gym_tracker.sheets import GoogleSheetsWriter, SheetsService
 class FakeWriter:
     def __init__(self, *, fails: bool = False) -> None:
         self.fails = fails
-        self.rows: list[list[Any]] = []
+        self.tabs: dict[str, list[list[Any]]] = {}
 
     def replace_rows(self, spreadsheet_id: str, tab: str, rows: list[list[Any]]) -> None:
         if self.fails:
             raise ConnectionError("offline")
         assert spreadsheet_id == "sheet-id"
-        assert tab == "Workout History"
-        self.rows = rows
+        self.tabs[tab] = rows
 
 
 def _database_with_result(tmp_path: Path) -> Database:
@@ -44,8 +43,30 @@ def test_successful_sync_exports_real_rows_and_clears_pending(tmp_path: Path) ->
     sync = SheetsService(database, "sheet-id", writer)
     assert sync.sync()["rows"] == 1
     assert sync.status()["pending"] == 0
-    assert writer.rows[1][4] == "overhead press"
-    assert writer.rows[1][10] == 15
+    assert writer.tabs["Strength History"][1][1] == "Geoff"
+    assert writer.tabs["Strength History"][1][5] == "overhead press"
+    assert writer.tabs["Strength History"][1][11] == 15
+    assert set(writer.tabs) == {"Strength History", "Cardio History", "Daily Energy", "Users"}
+
+
+def test_daily_energy_sheet_separates_user_and_exposes_estimate_components(tmp_path: Path) -> None:
+    database = Database(tmp_path / "gym.sqlite3")
+    service = GymService(database)
+    service.set_profile("freedom", "5ft 6in", "150 lb", "1987-04-12", "female")
+    service.log_cardio(
+        user="freedom",
+        activity="hiking",
+        duration="41m",
+        rpe=7,
+        activity_date="2026-08-18",
+        source="manual",
+    )
+    writer = FakeWriter()
+    SheetsService(database, "sheet-id", writer).sync()
+    row = writer.tabs["Daily Energy"][1]
+    assert row[1] == "Freedom"
+    assert row[2] > 0
+    assert row[8] == round(row[4] + row[5])
 
 
 def test_sync_failure_never_rolls_back_local_workout_data(tmp_path: Path) -> None:

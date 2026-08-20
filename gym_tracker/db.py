@@ -9,12 +9,19 @@ from pathlib import Path
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS users (
+ id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+ display_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+);
+INSERT OR IGNORE INTO users(id,slug,display_name) VALUES(1,'geoff','Geoff');
+INSERT OR IGNORE INTO users(id,slug,display_name) VALUES(2,'freedom','Freedom');
 CREATE TABLE IF NOT EXISTS workout_sessions (
  id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
  local_date TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
  orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
  status TEXT NOT NULL CHECK(status IN ('planned','active','completed','skipped')),
- notes TEXT NOT NULL DEFAULT ''
+ notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_day
  ON workout_sessions(local_date) WHERE source = 'scheduled';
@@ -63,6 +70,37 @@ CREATE TABLE IF NOT EXISTS sync_state (
  last_success_at TEXT, last_error TEXT
 );
 INSERT OR IGNORE INTO sync_state(singleton,pending) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS user_identities (
+ id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), platform TEXT NOT NULL,
+ external_sender_id TEXT NOT NULL, display_hint TEXT,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(platform,external_sender_id)
+);
+CREATE TABLE IF NOT EXISTS metabolic_profiles (
+ id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+ height_cm REAL, weight_kg REAL, birth_date TEXT,
+ bmr_equation TEXT NOT NULL DEFAULT 'mifflin_st_jeor_v1',
+ bmr_sex_parameter TEXT CHECK(bmr_sex_parameter IN ('female','male')),
+ baseline_activity_factor REAL NOT NULL DEFAULT 1.20,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS cardio_sessions (
+ id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
+ submitted_by_user_id INTEGER REFERENCES users(id), activity_type TEXT NOT NULL,
+ canonical_activity TEXT NOT NULL, started_at TEXT NOT NULL, local_date TEXT NOT NULL,
+ duration_seconds INTEGER NOT NULL CHECK(duration_seconds > 0), distance_meters REAL,
+ elevation_gain_meters REAL, intensity_rpe INTEGER NOT NULL CHECK(intensity_rpe BETWEEN 1 AND 10),
+ met_value REAL NOT NULL, met_source TEXT NOT NULL, met_table_version TEXT NOT NULL,
+ gross_calories_kcal REAL NOT NULL, net_calories_kcal REAL NOT NULL,
+ calorie_method TEXT NOT NULL, imported_total_calories_kcal REAL,
+ source TEXT NOT NULL, source_external_id TEXT, source_message_id TEXT,
+ notes TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(source,source_external_id)
+);
+CREATE INDEX IF NOT EXISTS ix_workout_sessions_user_date ON workout_sessions(user_id,local_date);
+CREATE INDEX IF NOT EXISTS ix_cardio_sessions_user_date ON cardio_sessions(user_id,local_date);
 """
 
 
@@ -75,8 +113,65 @@ class Database:
     def initialize(self) -> None:
         """Create the parent directory and current schema."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_workouts()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+
+    def _migrate_legacy_workouts(self) -> None:
+        """Restart-safely rebuild the legacy parent with non-null Geoff ownership."""
+        connection = sqlite3.connect(self.path)
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workout_sessions'"
+            ).fetchone()
+            columns = (
+                []
+                if exists is None
+                else connection.execute("PRAGMA table_info(workout_sessions)").fetchall()
+            )
+            user_column = next((column for column in columns if column[1] == "user_id"), None)
+            if exists is None or (user_column is not None and user_column[3] == 1):
+                return
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            connection.executescript(
+                """BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS users (
+                 id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                 display_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)));
+                INSERT OR IGNORE INTO users(id,slug,display_name) VALUES(1,'geoff','Geoff');
+                INSERT OR IGNORE INTO users(id,slug,display_name) VALUES(2,'freedom','Freedom');
+                ALTER TABLE workout_sessions RENAME TO workout_sessions_legacy;
+                CREATE TABLE workout_sessions (
+                 id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
+                 local_date TEXT NOT NULL,
+                 source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
+                 orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
+                 status TEXT NOT NULL CHECK(status IN ('planned','active','completed','skipped')),
+                 notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));"""
+            )
+            if user_column is None:
+                connection.execute(
+                    """INSERT INTO workout_sessions
+                    (id,started_at,completed_at,local_date,source,orientation,status,notes,user_id)
+                    SELECT id,started_at,completed_at,local_date,source,orientation,status,notes,1
+                    FROM workout_sessions_legacy"""
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO workout_sessions
+                    (id,started_at,completed_at,local_date,source,orientation,status,notes,user_id)
+                    SELECT id,started_at,completed_at,local_date,source,orientation,status,notes,
+                    COALESCE(user_id,1) FROM workout_sessions_legacy"""
+                )
+            connection.execute("DROP TABLE workout_sessions_legacy")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

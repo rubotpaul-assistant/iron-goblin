@@ -130,3 +130,105 @@ def test_unknown_entities_are_clear_errors(service: GymService) -> None:
         service.remove_equipment("missing")
     with pytest.raises(GymError, match="unknown exercise"):
         service.add_alias("alias", "missing")
+
+
+def test_legacy_database_migrates_every_workout_to_geoff(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """CREATE TABLE workout_sessions (
+        id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
+        local_date TEXT NOT NULL, source TEXT NOT NULL, orientation TEXT NOT NULL,
+        status TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '');
+        INSERT INTO workout_sessions VALUES
+        (7,'2026-08-01T10:00:00-07:00',NULL,'2026-08-01','manual','vertical','active','keep');
+        CREATE TABLE workout_exercises (
+        id INTEGER PRIMARY KEY,
+        workout_session_id INTEGER NOT NULL REFERENCES workout_sessions(id));
+        INSERT INTO workout_exercises VALUES(9,7);"""
+    )
+    connection.close()
+    database = Database(path)
+    database.initialize()
+    with database.connect() as migrated:
+        row = migrated.execute(
+            """SELECT ws.id,ws.notes,u.slug FROM workout_sessions ws
+            JOIN users u ON u.id=ws.user_id"""
+        ).fetchone()
+        nullable = next(
+            item["notnull"]
+            for item in migrated.execute("PRAGMA table_info(workout_sessions)")
+            if item["name"] == "user_id"
+        )
+        foreign_keys = migrated.execute("PRAGMA foreign_key_check").fetchall()
+    assert dict(row) == {"id": 7, "notes": "keep", "slug": "geoff"}
+    assert nullable == 1
+    assert foreign_keys == []
+
+
+def test_users_identity_profiles_cardio_and_daily_energy_are_isolated(
+    service: GymService,
+) -> None:
+    assert [user["slug"] for user in service.list_users()["users"]] == ["freedom", "geoff"]
+    service.map_identity("discord", "579188864804192268", "geoff", "Geoff")
+    assert service.resolve_identity("discord", "579188864804192268")["user"] == "geoff"
+    assert service.resolve_identity("discord", "unknown")["requires_clarification"] is True
+    service.set_profile("freedom", "5ft 6in", "150 lb", "1987-04-12", "female")
+    logged = service.log_cardio(
+        user="freedom",
+        activity="hike",
+        duration="41m",
+        distance="1.41 mi",
+        elevation_gain="240 ft",
+        rpe=7,
+        activity_date="2026-08-18",
+        source="alltrails_screenshot",
+        source_message_id="abc",
+        notes="Senador Mine loop",
+        submitted_by="geoff",
+    )
+    assert logged["user"] == "freedom"
+    assert logged["canonical_activity"] == "hiking"
+    assert logged["net_calories_kcal"] < logged["gross_calories_kcal"]
+    assert service.recent_cardio("geoff")["sessions"] == []
+    assert len(service.recent_cardio("freedom")["sessions"]) == 1
+    duplicate = service.log_cardio(
+        user="freedom",
+        activity="hiking",
+        duration="41m",
+        distance="1.41 mi",
+        elevation_gain="240 ft",
+        rpe=7,
+        activity_date="2026-08-18",
+        source="alltrails_screenshot",
+    )
+    assert duplicate["possible_duplicate"] is True
+    daily = service.daily_calories("freedom", "2026-08-18")
+    assert daily["cardio_net_kcal"] == logged["net_calories_kcal"]
+    assert (
+        abs(daily["estimated_total_kcal"] - (daily["baseline_kcal"] + daily["cardio_net_kcal"]))
+        <= 1
+    )
+    assert daily["strength_net_kcal"] is None
+
+
+def test_imported_calories_take_precedence_and_missing_profile_is_structured(
+    service: GymService,
+) -> None:
+    with pytest.raises(GymError, match="missing profile fields: height_cm,weight_kg,birth_date"):
+        service.daily_calories("freedom", "2026-08-18")
+    service.set_profile("freedom", "66 in", "150 lb", "1987-04-12", "female")
+    result = service.log_cardio(
+        user="freedom",
+        activity="walking",
+        duration="30m",
+        rpe=3,
+        activity_date="2026-08-18",
+        source="health_connect",
+        source_external_id="hc-1",
+        imported_calories=Decimal("222"),
+    )
+    assert result["calorie_method"] == "health_connect"
+    assert service.daily_calories("freedom", "2026-08-18")["cardio_net_kcal"] == 222

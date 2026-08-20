@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -14,10 +14,52 @@ from gym_tracker.domain import (
     EquipmentRange,
     Orientation,
     Performance,
+    age_on_date,
+    met_calories,
+    mifflin_st_jeor_bmr,
+    parse_distance_meters,
+    parse_duration_seconds,
+    parse_height_cm,
+    parse_weight_kg,
     progression_weight,
 )
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
+
+ACTIVITY_ALIASES = {
+    "walk": "walking",
+    "walking": "walking",
+    "hike": "hiking",
+    "hiking": "hiking",
+    "trail hike": "hiking",
+    "run": "running",
+    "running": "running",
+    "bike ride": "cycling",
+    "cycling": "cycling",
+    "stationary bike": "cycling",
+    "elliptical": "elliptical",
+    "stairs": "stair_climber",
+    "stair climber": "stair_climber",
+    "rowing": "rowing",
+    "swimming": "swimming",
+    "treadmill": "treadmill",
+    "dance": "dance",
+    "other cardio": "other_cardio",
+    "other_cardio": "other_cardio",
+}
+MET_TABLE = {
+    "walking": (Decimal("2.8"), Decimal("3.8"), Decimal("5.0")),
+    "hiking": (Decimal("4.5"), Decimal("6.0"), Decimal("7.3")),
+    "running": (Decimal("6.0"), Decimal("8.3"), Decimal("11.0")),
+    "cycling": (Decimal("4.0"), Decimal("6.8"), Decimal("10.0")),
+    "elliptical": (Decimal("4.0"), Decimal("5.0"), Decimal("8.0")),
+    "stair_climber": (Decimal("4.0"), Decimal("6.0"), Decimal("9.0")),
+    "rowing": (Decimal("4.8"), Decimal("7.0"), Decimal("9.0")),
+    "swimming": (Decimal("4.8"), Decimal("6.0"), Decimal("9.8")),
+    "treadmill": (Decimal("3.5"), Decimal("5.0"), Decimal("8.0")),
+    "dance": (Decimal("3.0"), Decimal("5.0"), Decimal("7.8")),
+    "other_cardio": (Decimal("3.0"), Decimal("5.0"), Decimal("8.0")),
+}
 
 
 class GymError(Exception):
@@ -51,6 +93,268 @@ class GymService:
                 (name, equipment_type, float(minimum), float(maximum), float(increment), unit),
             )
         return {"ok": True, "equipment": name, "available": True}
+
+    def list_users(self) -> dict[str, Any]:
+        """List active workout owners without profile data."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT slug,display_name FROM users WHERE active=1 ORDER BY slug"
+            ).fetchall()
+        return {"ok": True, "users": [dict(row) for row in rows]}
+
+    def show_user(self, user: str) -> dict[str, Any]:
+        """Show one user without sensitive profile data."""
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT slug,display_name,active FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+        return {"ok": True, "user": dict(row)}
+
+    def map_identity(
+        self, platform: str, sender_id: str, user: str, hint: str | None = None
+    ) -> dict[str, Any]:
+        """Bind one stable platform sender to a user."""
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            connection.execute(
+                """INSERT INTO user_identities(user_id,platform,external_sender_id,display_hint)
+                VALUES(?,?,?,?) ON CONFLICT(platform,external_sender_id) DO UPDATE SET
+                user_id=excluded.user_id,display_hint=excluded.display_hint""",
+                (user_id, platform.lower(), sender_id, hint),
+            )
+        return {"ok": True, "platform": platform.lower(), "sender_id": sender_id, "user": user}
+
+    def resolve_identity(self, platform: str, sender_id: str) -> dict[str, Any]:
+        """Resolve a stable sender or explicitly request clarification."""
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT u.slug FROM user_identities i JOIN users u ON u.id=i.user_id
+                WHERE i.platform=? AND i.external_sender_id=?""",
+                (platform.lower(), sender_id),
+            ).fetchone()
+        if row is None:
+            return {
+                "ok": True,
+                "user": None,
+                "requires_clarification": True,
+                "question": "Is this for Geoff or Freedom?",
+            }
+        return {"ok": True, "user": row["slug"], "requires_clarification": False}
+
+    def set_profile(
+        self,
+        user: str,
+        height: str,
+        weight: str,
+        birth_date: str,
+        sex_parameter: str,
+        baseline_activity_factor: Decimal = Decimal("1.20"),
+    ) -> dict[str, Any]:
+        """Normalize and upsert one metabolic profile."""
+        if baseline_activity_factor < 1:
+            raise GymError("baseline activity factor must be at least 1.0")
+        try:
+            parsed_birth_date = date.fromisoformat(birth_date)
+            height_cm = parse_height_cm(height)
+            weight_kg = parse_weight_kg(weight)
+            mifflin_st_jeor_bmr(weight_kg, height_cm, 0, sex_parameter)
+        except ValueError as error:
+            raise GymError(str(error)) from error
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            connection.execute(
+                """INSERT INTO metabolic_profiles(
+                user_id,height_cm,weight_kg,birth_date,bmr_sex_parameter,baseline_activity_factor)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET
+                height_cm=excluded.height_cm,weight_kg=excluded.weight_kg,
+                birth_date=excluded.birth_date,bmr_sex_parameter=excluded.bmr_sex_parameter,
+                baseline_activity_factor=excluded.baseline_activity_factor,
+                updated_at=CURRENT_TIMESTAMP""",
+                (
+                    user_id,
+                    float(height_cm),
+                    float(weight_kg),
+                    parsed_birth_date.isoformat(),
+                    sex_parameter,
+                    float(baseline_activity_factor),
+                ),
+            )
+        return {"ok": True, "user": user, "profile_complete": True}
+
+    def profile(self, user: str) -> dict[str, Any]:
+        """Return normalized profile fields for explicit profile requests."""
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT height_cm,weight_kg,birth_date,bmr_equation,bmr_sex_parameter,
+                baseline_activity_factor FROM metabolic_profiles WHERE user_id=?""",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise GymError(f"no metabolic profile for user: {user}")
+        return {"ok": True, "user": user, "profile": dict(row)}
+
+    def bmr(self, user: str, requested_date: str) -> dict[str, Any]:
+        """Calculate BMR dynamically for the requested date."""
+        profile = self._required_profile(user)
+        calculation_date = (
+            datetime.now(tz=PACIFIC).date()
+            if requested_date == "today"
+            else date.fromisoformat(requested_date)
+        )
+        value = self._bmr_value(profile, calculation_date)
+        return {
+            "ok": True,
+            "user": user,
+            "date": calculation_date.isoformat(),
+            "bmr_kcal": round(value),
+            "equation": profile["bmr_equation"],
+        }
+
+    def log_cardio(
+        self,
+        *,
+        user: str,
+        activity: str,
+        duration: str,
+        rpe: int,
+        activity_date: str,
+        distance: str | None = None,
+        elevation_gain: str | None = None,
+        source: str = "manual",
+        source_external_id: str | None = None,
+        source_message_id: str | None = None,
+        notes: str = "",
+        submitted_by: str | None = None,
+        imported_calories: Decimal | None = None,
+    ) -> dict[str, Any]:
+        """Validate, deduplicate, calculate, and persist a cardio session."""
+        canonical = ACTIVITY_ALIASES.get(activity.lower())
+        if canonical is None:
+            raise GymError(f"unsupported cardio activity: {activity}")
+        if rpe < 1 or rpe > 10:
+            raise GymError("RPE must be between 1 and 10")
+        try:
+            duration_seconds = parse_duration_seconds(duration)
+            local_date = date.fromisoformat(activity_date).isoformat()
+            distance_meters = None if distance is None else parse_distance_meters(distance)
+            elevation_meters = (
+                None if elevation_gain is None else parse_distance_meters(elevation_gain)
+            )
+        except ValueError as error:
+            raise GymError(str(error)) from error
+        user_id = self._user_id(user)
+        profile = self._required_profile(user)
+        met = MET_TABLE[canonical][0 if rpe <= 3 else 1 if rpe <= 6 else 2]
+        gross, net = met_calories(met, Decimal(str(profile["weight_kg"])), duration_seconds)
+        with self.database.connect() as connection:
+            duplicate = connection.execute(
+                """SELECT id FROM cardio_sessions WHERE user_id=? AND local_date=?
+                AND canonical_activity=? AND ABS(duration_seconds-?)<=60
+                AND (distance_meters IS NULL AND ? IS NULL OR ABS(distance_meters-?)<=50)""",
+                (
+                    user_id,
+                    local_date,
+                    canonical,
+                    duration_seconds,
+                    None if distance_meters is None else float(distance_meters),
+                    None if distance_meters is None else float(distance_meters),
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                return {"ok": False, "possible_duplicate": True, "existing_id": duplicate["id"]}
+            method = source if imported_calories is not None else "met_v1"
+            cursor = connection.execute(
+                """INSERT INTO cardio_sessions(
+                user_id,submitted_by_user_id,activity_type,canonical_activity,started_at,local_date,
+                duration_seconds,distance_meters,elevation_gain_meters,intensity_rpe,met_value,
+                met_source,met_table_version,gross_calories_kcal,net_calories_kcal,calorie_method,
+                imported_total_calories_kcal,source,source_external_id,source_message_id,notes)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    user_id,
+                    None if submitted_by is None else self._user_id(submitted_by),
+                    activity,
+                    canonical,
+                    f"{local_date}T12:00:00",
+                    local_date,
+                    duration_seconds,
+                    None if distance_meters is None else float(distance_meters),
+                    None if elevation_meters is None else float(elevation_meters),
+                    rpe,
+                    float(met),
+                    "Compendium-derived static table",
+                    "iron_goblin_met_v1",
+                    float(gross),
+                    float(net),
+                    method,
+                    None if imported_calories is None else float(imported_calories),
+                    source,
+                    source_external_id,
+                    source_message_id,
+                    notes,
+                ),
+            )
+            connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {
+            "ok": True,
+            "id": int(cursor.lastrowid or 0),
+            "user": user,
+            "canonical_activity": canonical,
+            "gross_calories_kcal": round(gross),
+            "net_calories_kcal": round(imported_calories if imported_calories is not None else net),
+            "calorie_method": method,
+            "possible_duplicate": False,
+        }
+
+    def recent_cardio(self, user: str, limit: int = 10) -> dict[str, Any]:
+        """Return only one user's recent cardio history."""
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,local_date,canonical_activity,duration_seconds,distance_meters,
+                elevation_gain_meters,intensity_rpe,source FROM cardio_sessions
+                WHERE user_id=? ORDER BY started_at DESC,id DESC LIMIT ?""",
+                (user_id, limit),
+            ).fetchall()
+        return {"ok": True, "user": user, "sessions": [dict(row) for row in rows]}
+
+    def daily_calories(self, user: str, requested_date: str) -> dict[str, Any]:
+        """Aggregate modeled baseline and one selected calorie value per cardio session."""
+        calculation_date_value = (
+            datetime.now(tz=PACIFIC).date()
+            if requested_date == "today"
+            else date.fromisoformat(requested_date)
+        )
+        calculation_date = calculation_date_value.isoformat()
+        profile = self._required_profile(user)
+        bmr_value = self._bmr_value(profile, calculation_date_value)
+        factor = Decimal(str(profile["baseline_activity_factor"]))
+        baseline = bmr_value * factor
+        with self.database.connect() as connection:
+            cardio = connection.execute(
+                """SELECT COALESCE(SUM(COALESCE(imported_total_calories_kcal,
+                net_calories_kcal)),0) AS calories FROM cardio_sessions
+                WHERE user_id=? AND local_date=?""",
+                (self._user_id(user), calculation_date),
+            ).fetchone()["calories"]
+        cardio_value = Decimal(str(cardio))
+        return {
+            "ok": True,
+            "label": "Estimated daily burn",
+            "user": user,
+            "date": calculation_date,
+            "bmr_kcal": round(bmr_value),
+            "baseline_activity_factor": float(factor),
+            "baseline_kcal": round(baseline),
+            "cardio_net_kcal": round(cardio_value),
+            "strength_net_kcal": None,
+            "other_activity_kcal": 0,
+            "estimated_total_kcal": round(baseline + cardio_value),
+            "completeness": "modeled baseline plus logged exercise; passive movement unavailable",
+            "methods": [profile["bmr_equation"], "net_exercise_or_imported_source"],
+        }
 
     def list_equipment(self) -> dict[str, Any]:
         """List equipment without exposing configuration or credentials."""
@@ -144,14 +448,15 @@ class GymService:
             try:
                 cursor = connection.execute(
                     """INSERT INTO workout_sessions(
-                    started_at,local_date,source,orientation,status
-                    ) VALUES(?,?,?,?,?)""",
+                    started_at,local_date,source,orientation,status,user_id
+                    ) VALUES(?,?,?,?,?,?)""",
                     (
                         timestamp.isoformat(),
                         local_date,
                         "scheduled" if scheduled else "manual",
                         orientation.value,
                         "active",
+                        self._user_id("geoff"),
                     ),
                 )
             except sqlite3.IntegrityError as error:
@@ -287,6 +592,41 @@ class GymService:
         if row is None:
             raise GymError(f"unknown exercise: {name}")
         return int(row["id"])
+
+    def _user_id(self, slug: str) -> int:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM users WHERE slug=? COLLATE NOCASE AND active=1", (slug,)
+            ).fetchone()
+        if row is None:
+            raise GymError(f"unknown user: {slug}")
+        return int(row["id"])
+
+    def _required_profile(self, user: str) -> sqlite3.Row:
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT height_cm,weight_kg,birth_date,bmr_equation,bmr_sex_parameter,
+                baseline_activity_factor FROM metabolic_profiles WHERE user_id=?""",
+                (user_id,),
+            ).fetchone()
+        required = ("height_cm", "weight_kg", "birth_date", "bmr_sex_parameter")
+        missing = (
+            list(required) if row is None else [field for field in required if row[field] is None]
+        )
+        if missing:
+            raise GymError(f"missing profile fields: {','.join(missing)}")
+        return cast("sqlite3.Row", row)
+
+    @staticmethod
+    def _bmr_value(profile: sqlite3.Row, calculation_date: date) -> Decimal:
+        age = age_on_date(date.fromisoformat(profile["birth_date"]), calculation_date)
+        return mifflin_st_jeor_bmr(
+            Decimal(str(profile["weight_kg"])),
+            Decimal(str(profile["height_cm"])),
+            age,
+            str(profile["bmr_sex_parameter"]),
+        )
 
     @staticmethod
     def _existing_workout(

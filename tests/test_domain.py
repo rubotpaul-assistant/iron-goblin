@@ -1,8 +1,21 @@
 """Pure domain rule tests."""
 
+from datetime import date
 from decimal import Decimal
 
-from gym_tracker.domain import EquipmentRange, Orientation, Performance, progression_weight
+from gym_tracker.domain import (
+    EquipmentRange,
+    Orientation,
+    Performance,
+    age_on_date,
+    met_calories,
+    mifflin_st_jeor_bmr,
+    parse_distance_meters,
+    parse_duration_seconds,
+    parse_height_cm,
+    parse_weight_kg,
+    progression_weight,
+)
 
 
 def test_orientation_opposite_round_trip() -> None:
@@ -39,3 +52,33 @@ def test_equipment_range_rejects_unsupported_weights_and_caps_increase() -> None
     assert equipment.contains(90)
     assert not equipment.contains(95)
     assert equipment.next_weight(100) == 100
+
+
+def test_metabolic_math_and_age_are_deterministic() -> None:
+    assert age_on_date(date(1987, 9, 1), date(2026, 8, 18)) == 38
+    assert mifflin_st_jeor_bmr(Decimal(68), Decimal(165), 38, "female") == Decimal("1360.25")
+    gross, net = met_calories(Decimal("7.3"), Decimal(68), 2460)
+    assert gross.quantize(Decimal("0.01")) == Decimal("356.17")
+    assert net.quantize(Decimal("0.01")) == Decimal("307.38")
+    assert net < gross
+
+
+def test_us_units_normalize_to_metric() -> None:
+    assert parse_height_cm("5ft 6in").quantize(Decimal("0.01")) == Decimal("167.64")
+    assert parse_weight_kg("150 lb").quantize(Decimal("0.01")) == Decimal("68.04")
+    assert parse_distance_meters("1.41 mi").quantize(Decimal("0.01")) == Decimal("2269.18")
+    assert parse_duration_seconds("41m") == 2460
+    assert parse_height_cm("1.7m") == Decimal("170.0")
+    assert parse_distance_meters("2 km") == Decimal(2000)
+    assert parse_distance_meters("240 ft") == Decimal("73.1520")
+
+
+def test_domain_parsers_reject_missing_values() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="female or male"):
+        mifflin_st_jeor_bmr(Decimal(68), Decimal(165), 38, "unknown")
+    with pytest.raises(ValueError, match="numeric"):
+        parse_weight_kg("many")
+    with pytest.raises(ValueError, match="duration"):
+        parse_duration_seconds("41")
