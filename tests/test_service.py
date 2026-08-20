@@ -66,6 +66,79 @@ def test_recommendations_match_orientation_and_exclude_unavailable_equipment(
     }
 
 
+def test_third_performed_workout_uses_prior_results_for_weights(
+    service: GymService,
+) -> None:
+    first = service.begin_workout()
+    assert first["workout_number"] == 1
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5), final_rir=1)
+    service.complete_workout()
+
+    second = service.begin_workout()
+    assert second["workout_number"] == 2
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5), final_rir=1)
+    service.complete_workout()
+
+    third = service.begin_workout()
+
+    assert third["workout_number"] == 3
+    assert {item["weight"] for item in third["recommendations"]} == {100}
+    assert {item["weight_status"] for item in third["recommendations"]} == {"known"}
+    assert {tuple(item["previous_set_weights"]) for item in third["recommendations"]} == {
+        (90, 90, 90)
+    }
+
+
+def test_prior_final_set_is_baseline_without_equipment(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+    for category in Category:
+        service.add_exercise(f"vertical {category}", category, Orientation.VERTICAL, "free_weight")
+        service.add_exercise(
+            f"horizontal {category}", category, Orientation.HORIZONTAL, "free_weight"
+        )
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(
+            f"vertical {category}",
+            (Decimal(45), Decimal(45), Decimal(65)),
+            (5, 5, 5),
+        )
+    service.complete_workout()
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(50), (5, 5, 5))
+    service.complete_workout()
+
+    recommendation = service.begin_workout()["recommendations"][0]
+
+    assert recommendation["weight"] == 65
+    assert recommendation["previous_set_weights"] == [45, 45, 65]
+
+
+def test_current_workout_recovers_legacy_null_prescription(service: GymService) -> None:
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+    service.begin_workout()
+    with service.database.connect() as connection:
+        connection.execute(
+            """UPDATE workout_exercises SET prescribed_weight=NULL
+            WHERE workout_session_id=(SELECT id FROM workout_sessions WHERE status='active')"""
+        )
+
+    current = service.current_workout()
+
+    assert {item["weight"] for item in current["recommendations"]} == {90}
+    assert {item["weight_status"] for item in current["recommendations"]} == {"known"}
+
+
 def test_completion_requires_all_categories(service: GymService) -> None:
     service.begin_workout()
     service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=0)
@@ -73,7 +146,9 @@ def test_completion_requires_all_categories(service: GymService) -> None:
         service.complete_workout()
     service.log_exercise("vertical pull", Decimal(90), (5, 5, 5), final_rir=1)
     service.log_exercise("vertical legs", Decimal(90), (5, 5, 4), final_rir=0)
-    assert service.complete_workout()["status"] == "completed"
+    completed = service.complete_workout()
+    assert completed["status"] == "completed"
+    assert completed["workout_number"] == 1
 
 
 def test_logging_respects_increment_and_progression(service: GymService) -> None:

@@ -547,6 +547,7 @@ class GymService:
             remaining = self._remaining(connection, int(workout["id"]))
             if remaining:
                 raise GymError(f"workout incomplete; remaining: {','.join(remaining)}")
+            workout_number = self._workout_number(connection, int(workout["id"]))
             completed_at = datetime.now(tz=PACIFIC).isoformat()
             connection.execute(
                 "UPDATE workout_sessions SET status='completed',completed_at=? WHERE id=?",
@@ -556,6 +557,7 @@ class GymService:
         return {
             "ok": True,
             "workout_id": workout["id"],
+            "workout_number": workout_number,
             "status": "completed",
             "sync_pending": True,
         }
@@ -706,12 +708,53 @@ class GymService:
                 (category.value, orientation.value),
             ).fetchone()
             if candidate:
+                prescribed_weight, _ = self._prior_prescription(
+                    connection, workout_id, int(candidate["id"])
+                )
                 connection.execute(
                     """INSERT INTO workout_exercises(
-                    workout_session_id,exercise_id,unit,sequence
-                    ) VALUES(?,?,?,?)""",
-                    (workout_id, candidate["id"], candidate["default_unit"], sequence),
+                    workout_session_id,exercise_id,prescribed_weight,unit,sequence
+                    ) VALUES(?,?,?,?,?)""",
+                    (
+                        workout_id,
+                        candidate["id"],
+                        prescribed_weight,
+                        candidate["default_unit"],
+                        sequence,
+                    ),
                 )
+
+    def _prior_prescription(
+        self, connection: sqlite3.Connection, workout_id: int, exercise_id: int
+    ) -> tuple[float | None, list[float]]:
+        """Derive a prescription from the user's latest recorded result."""
+        rows = connection.execute(
+            """SELECT s.completed_reps,s.weight,s.rir,s.technical_failure
+            FROM sets s WHERE s.workout_exercise_id=(
+             SELECT wx.id FROM workout_exercises wx
+             JOIN workout_sessions previous ON previous.id=wx.workout_session_id
+             JOIN workout_sessions current ON current.id=?
+             WHERE wx.exercise_id=? AND previous.user_id=current.user_id
+             AND previous.id<>current.id AND EXISTS(
+              SELECT 1 FROM sets recorded WHERE recorded.workout_exercise_id=wx.id)
+             ORDER BY previous.started_at DESC,previous.id DESC LIMIT 1)
+            ORDER BY s.set_number""",
+            (workout_id, exercise_id),
+        ).fetchall()
+        if not rows:
+            return None, []
+        previous_weights = [float(row["weight"]) for row in rows]
+        working_weight = Decimal(str(rows[-1]["weight"]))
+        equipment = self._equipment_for_exercise(connection, exercise_id)
+        if equipment is None:
+            return float(working_weight), previous_weights
+        performance = Performance(
+            cast("tuple[int, int, int]", tuple(int(row["completed_reps"]) for row in rows)),
+            None if rows[-1]["rir"] is None else int(rows[-1]["rir"]),
+            bool(rows[-1]["technical_failure"]),
+        )
+        prescribed_weight, _ = progression_weight(working_weight, performance, equipment)
+        return float(prescribed_weight), previous_weights
 
     def _workout_payload(
         self, connection: sqlite3.Connection, workout_id: int, *, duplicate: bool
@@ -720,25 +763,66 @@ class GymService:
             "SELECT * FROM workout_sessions WHERE id=?", (workout_id,)
         ).fetchone()
         recommendations = connection.execute(
-            """SELECT e.category,e.canonical_name AS exercise,wx.prescribed_weight AS weight,
+            """SELECT e.id AS exercise_id,e.category,e.canonical_name AS exercise,
+            wx.prescribed_weight AS weight,
             wx.unit,3 AS sets,5 AS reps FROM workout_exercises wx
             JOIN exercises e ON e.id=wx.exercise_id
             WHERE wx.workout_session_id=? ORDER BY wx.sequence""",
             (workout_id,),
         ).fetchall()
+        prior_results = {
+            int(row["exercise_id"]): self._prior_prescription(
+                connection, workout_id, int(row["exercise_id"])
+            )
+            for row in recommendations
+        }
+        workout_number = self._workout_number(connection, workout_id)
+        recommendation_payloads = []
+        for row in recommendations:
+            prior_weight, previous_set_weights = prior_results[int(row["exercise_id"])]
+            weight = row["weight"] if row["weight"] is not None else prior_weight
+            recommendation_payloads.append(
+                {key: value for key, value in dict(row).items() if key != "exercise_id"}
+                | {
+                    "weight": weight,
+                    "weight_status": "baseline_required" if weight is None else "known",
+                    "previous_set_weights": previous_set_weights,
+                }
+            )
         return {
             "ok": True,
             "workout_id": workout_id,
+            "workout_number": workout_number,
             "orientation": workout["orientation"],
             "status": workout["status"],
             "duplicate": duplicate,
             "remaining_categories": self._remaining(connection, workout_id),
-            "recommendations": [
-                dict(row)
-                | {"weight_status": "baseline_required" if row["weight"] is None else "known"}
-                for row in recommendations
-            ],
+            "recommendations": recommendation_payloads,
         }
+
+    @staticmethod
+    def _workout_number(connection: sqlite3.Connection, workout_id: int) -> int:
+        """Return the user's performed-workout ordinal, ignoring empty lifecycle shells."""
+        workout = connection.execute(
+            "SELECT user_id,started_at FROM workout_sessions WHERE id=?", (workout_id,)
+        ).fetchone()
+        performed_before = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM workout_sessions previous
+                WHERE previous.user_id=? AND previous.id<>? AND EXISTS(
+                 SELECT 1 FROM workout_exercises wx JOIN sets s ON s.workout_exercise_id=wx.id
+                 WHERE wx.workout_session_id=previous.id)
+                AND (previous.started_at<? OR previous.started_at=? AND previous.id<?)""",
+                (
+                    workout["user_id"],
+                    workout_id,
+                    workout["started_at"],
+                    workout["started_at"],
+                    workout_id,
+                ),
+            ).fetchone()[0]
+        )
+        return performed_before + 1
 
     @staticmethod
     def _remaining(connection: sqlite3.Connection, workout_id: int) -> list[str]:
