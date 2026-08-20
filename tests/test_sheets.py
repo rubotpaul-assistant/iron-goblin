@@ -81,7 +81,7 @@ def test_sync_failure_never_rolls_back_local_workout_data(tmp_path: Path) -> Non
 def test_sync_requires_spreadsheet_reference(tmp_path: Path) -> None:
     database = Database(tmp_path / "gym.sqlite3")
     database.initialize()
-    with pytest.raises(ValueError, match="GYM_SPREADSHEET_ID"):
+    with pytest.raises(ValueError, match="SPREADSHEET_ID"):
         SheetsService(database, None, FakeWriter()).sync()
 
 

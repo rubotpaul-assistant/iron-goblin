@@ -125,6 +125,36 @@ def test_history_and_input_boundaries(service: GymService) -> None:
         service.log_exercise("vertical push", Decimal(90), (5, -1, 5))
 
 
+def test_history_summary_counts_recorded_sets_not_lifecycle_shells(
+    service: GymService,
+) -> None:
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+    with service.database.connect() as connection:
+        connection.execute(
+            """INSERT INTO workout_sessions
+            (started_at,local_date,source,orientation,status,user_id)
+            VALUES('2026-08-20T09:00:00-07:00','2026-08-20','manual','vertical','skipped',1)"""
+        )
+
+    result = service.history_summary("geoff")
+
+    assert result["strength"] == {
+        "workouts": 2,
+        "exercises": 6,
+        "sets": 18,
+        "raw_session_rows": 3,
+        "status_counts": {"active": 1, "completed": 1},
+    }
+    assert result["cardio_sessions"] == 0
+
+
 def test_unknown_entities_are_clear_errors(service: GymService) -> None:
     with pytest.raises(GymError, match="unknown equipment"):
         service.remove_equipment("missing")

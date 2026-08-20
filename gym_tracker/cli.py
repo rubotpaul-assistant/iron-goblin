@@ -196,6 +196,16 @@ def history_recent(limit: Annotated[int, typer.Option("--limit")] = 10) -> None:
     _run(_service().recent_history, limit)
 
 
+@history_app.command("summary")
+def history_summary(
+    user: Annotated[str, typer.Option("--user")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Summarize user history from recorded workout results."""
+    del json_output
+    _run(_service().history_summary, user)
+
+
 @user_app.command("list")
 def user_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
     """List active users."""

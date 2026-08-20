@@ -19,5 +19,5 @@ class Settings:
         """Load safe settings; authentication libraries read credentials themselves."""
         return cls(
             database_path=Path(os.getenv("GYM_DATABASE_PATH", "data/gym.sqlite3")),
-            spreadsheet_id=os.getenv("GYM_SPREADSHEET_ID"),
+            spreadsheet_id=os.getenv("SPREADSHEET_ID") or os.getenv("GYM_SPREADSHEET_ID"),
         )

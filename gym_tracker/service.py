@@ -582,6 +582,51 @@ class GymService:
             ).fetchall()
         return {"ok": True, "workouts": [dict(row) for row in rows]}
 
+    def history_summary(self, user: str) -> dict[str, Any]:
+        """Summarize user history from recorded sets, excluding empty session shells."""
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            raw_session_rows = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workout_sessions WHERE user_id=?", (user_id,)
+                ).fetchone()[0]
+            )
+            workout_rows = connection.execute(
+                """SELECT ws.id,ws.local_date,ws.orientation,ws.status,
+                COUNT(DISTINCT wx.id) AS exercises,COUNT(s.id) AS sets
+                FROM workout_sessions ws
+                JOIN workout_exercises wx ON wx.workout_session_id=ws.id
+                JOIN sets s ON s.workout_exercise_id=wx.id
+                WHERE ws.user_id=?
+                GROUP BY ws.id
+                HAVING COUNT(s.id)>0
+                ORDER BY ws.started_at,ws.id""",
+                (user_id,),
+            ).fetchall()
+            cardio_sessions = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM cardio_sessions WHERE user_id=?", (user_id,)
+                ).fetchone()[0]
+            )
+        workouts = [dict(row) for row in workout_rows]
+        status_counts: dict[str, int] = {}
+        for workout in workouts:
+            status = str(workout["status"])
+            status_counts[status] = status_counts.get(status, 0) + 1
+        return {
+            "ok": True,
+            "user": user,
+            "strength": {
+                "workouts": len(workouts),
+                "exercises": sum(int(workout["exercises"]) for workout in workouts),
+                "sets": sum(int(workout["sets"]) for workout in workouts),
+                "raw_session_rows": raw_session_rows,
+                "status_counts": status_counts,
+            },
+            "cardio_sessions": cardio_sessions,
+            "workouts": workouts,
+        }
+
     def _exercise_id(self, name: str) -> int:
         with self.database.connect() as connection:
             row = connection.execute(

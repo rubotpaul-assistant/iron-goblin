@@ -28,6 +28,17 @@ def test_cli_reports_structured_error(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert json.loads(result.stdout)["error"] == "no active workout"
 
 
+def test_history_summary_is_user_scoped_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+
+    result = CliRunner().invoke(app, ["history", "summary", "--user", "geoff", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["user"] == "geoff"
+
+
 def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
     runner = CliRunner()

@@ -43,7 +43,7 @@ class SheetsService:
     def sync(self) -> dict[str, Any]:
         """Replace derived rows and preserve pending state when Google fails."""
         if not self.spreadsheet_id:
-            raise ValueError("GYM_SPREADSHEET_ID is not configured")
+            raise ValueError("SPREADSHEET_ID is not configured")
         try:
             with self.database.connect() as connection:
                 tabs = {
