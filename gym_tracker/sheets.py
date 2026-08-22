@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from importlib import import_module
 from json import JSONDecodeError, loads
 from os import getenv
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from gym_tracker.db import Database
+from gym_tracker.domain import age_on_date, mifflin_st_jeor_bmr
 
 
 class SheetsWriter(Protocol):
@@ -41,11 +43,17 @@ class SheetsService:
     def sync(self) -> dict[str, Any]:
         """Replace derived rows and preserve pending state when Google fails."""
         if not self.spreadsheet_id:
-            raise ValueError("GYM_SPREADSHEET_ID is not configured")
+            raise ValueError("SPREADSHEET_ID is not configured")
         try:
             with self.database.connect() as connection:
-                rows = self._history_rows(connection)
-            self.writer.replace_rows(self.spreadsheet_id, "Workout History", rows)
+                tabs = {
+                    "Strength History": self._history_rows(connection),
+                    "Cardio History": self._cardio_rows(connection),
+                    "Daily Energy": self._daily_energy_rows(connection),
+                    "Users": self._user_rows(connection),
+                }
+            for tab, rows in tabs.items():
+                self.writer.replace_rows(self.spreadsheet_id, tab, rows)
         except Exception as error:
             with self.database.connect() as connection:
                 connection.execute(
@@ -60,12 +68,18 @@ class SheetsService:
                 WHERE singleton=1""",
                 (completed_at,),
             )
-        return {"ok": True, "rows": len(rows) - 1, "pending": False}
+        return {
+            "ok": True,
+            "rows": len(tabs["Strength History"]) - 1,
+            "tabs": list(tabs),
+            "pending": False,
+        }
 
     @staticmethod
     def _history_rows(connection: sqlite3.Connection) -> list[list[Any]]:
         header = [
             "Date",
+            "User",
             "Workout ID",
             "Orientation",
             "Category",
@@ -81,17 +95,116 @@ class SheetsService:
             "Notes",
         ]
         records = connection.execute(
-            """SELECT ws.local_date,ws.id,ws.orientation,e.category,e.canonical_name,
+            """SELECT ws.local_date,u.display_name,ws.id,ws.orientation,e.category,e.canonical_name,
             MAX(s.weight),MAX(s.unit),MAX(CASE WHEN s.set_number=1 THEN s.completed_reps END),
             MAX(CASE WHEN s.set_number=2 THEN s.completed_reps END),
             MAX(CASE WHEN s.set_number=3 THEN s.completed_reps END),
             COALESCE(SUM(s.completed_reps),0),
             MAX(CASE WHEN s.set_number=3 THEN s.rir END),MAX(s.technical_failure),ws.notes
-            FROM workout_sessions ws JOIN workout_exercises wx ON wx.workout_session_id=ws.id
+            FROM workout_sessions ws JOIN users u ON u.id=ws.user_id
+            JOIN workout_exercises wx ON wx.workout_session_id=ws.id
             JOIN exercises e ON e.id=wx.exercise_id LEFT JOIN sets s ON s.workout_exercise_id=wx.id
             GROUP BY ws.id,wx.id ORDER BY ws.started_at,wx.sequence"""
         ).fetchall()
         return [header, *[list(record) for record in records]]
+
+    @staticmethod
+    def _cardio_rows(connection: sqlite3.Connection) -> list[list[Any]]:
+        header = [
+            "Date",
+            "User",
+            "Activity",
+            "Duration Seconds",
+            "Distance Meters",
+            "Elevation Gain Meters",
+            "RPE",
+            "MET",
+            "Gross Calories",
+            "Net Calories",
+            "Counted Calories",
+            "Method",
+            "Source",
+            "Notes",
+        ]
+        records = connection.execute(
+            """SELECT c.local_date,u.display_name,c.canonical_activity,c.duration_seconds,
+            c.distance_meters,c.elevation_gain_meters,c.intensity_rpe,c.met_value,
+            ROUND(c.gross_calories_kcal),ROUND(c.net_calories_kcal),
+            ROUND(COALESCE(c.imported_total_calories_kcal,c.net_calories_kcal)),
+            c.calorie_method,c.source,c.notes FROM cardio_sessions c
+            JOIN users u ON u.id=c.user_id ORDER BY c.started_at,c.id"""
+        ).fetchall()
+        return [header, *[list(record) for record in records]]
+
+    @staticmethod
+    def _daily_energy_rows(connection: sqlite3.Connection) -> list[list[Any]]:
+        header = [
+            "Date",
+            "User",
+            "BMR",
+            "Baseline Factor",
+            "Baseline Calories",
+            "Cardio Calories",
+            "Strength Calories",
+            "Other Imported Activity",
+            "Estimated Total Calories",
+            "Completeness",
+        ]
+        records = connection.execute(
+            """SELECT c.local_date,u.display_name,p.height_cm,p.weight_kg,p.birth_date,
+            p.bmr_sex_parameter,p.baseline_activity_factor,
+            ROUND(SUM(COALESCE(c.imported_total_calories_kcal,c.net_calories_kcal)))
+            FROM cardio_sessions c JOIN users u ON u.id=c.user_id
+            LEFT JOIN metabolic_profiles p ON p.user_id=c.user_id
+            GROUP BY c.local_date,c.user_id ORDER BY c.local_date,u.display_name"""
+        ).fetchall()
+        return [header, *[SheetsService._daily_energy_record(record) for record in records]]
+
+    @staticmethod
+    def _daily_energy_record(record: sqlite3.Row) -> list[Any]:
+        """Build a truthful daily row, leaving baseline blank without a complete profile."""
+        profile_values = record[2:6]
+        cardio = record[7]
+        if any(value is None for value in profile_values):
+            return [
+                record[0],
+                record[1],
+                None,
+                record[6],
+                None,
+                cardio,
+                None,
+                0,
+                None,
+                "logged cardio only; metabolic profile incomplete",
+            ]
+        requested_date = date.fromisoformat(record[0])
+        age = age_on_date(date.fromisoformat(record[4]), requested_date)
+        bmr = mifflin_st_jeor_bmr(
+            Decimal(str(record[3])), Decimal(str(record[2])), age, str(record[5])
+        )
+        factor = Decimal(str(record[6]))
+        baseline = bmr * factor
+        total = baseline + Decimal(str(cardio))
+        return [
+            record[0],
+            record[1],
+            round(bmr),
+            float(factor),
+            round(baseline),
+            cardio,
+            None,
+            0,
+            round(total),
+            "modeled baseline plus logged exercise",
+        ]
+
+    @staticmethod
+    def _user_rows(connection: sqlite3.Connection) -> list[list[Any]]:
+        records = connection.execute(
+            "SELECT slug,display_name,active FROM users ORDER BY slug"
+        ).fetchall()
+        return [["Slug", "Display Name", "Active"], *[list(record) for record in records]]
 
 
 class GoogleSheetsWriter:

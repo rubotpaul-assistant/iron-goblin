@@ -21,12 +21,22 @@ exercise_app = typer.Typer(no_args_is_help=True)
 equipment_app = typer.Typer(no_args_is_help=True)
 history_app = typer.Typer(no_args_is_help=True)
 sheets_app = typer.Typer(no_args_is_help=True)
+user_app = typer.Typer(no_args_is_help=True)
+profile_app = typer.Typer(no_args_is_help=True)
+identity_app = typer.Typer(no_args_is_help=True)
+cardio_app = typer.Typer(no_args_is_help=True)
+calories_app = typer.Typer(no_args_is_help=True)
 app.add_typer(workout_app, name="workout")
 app.add_typer(log_app, name="log")
 app.add_typer(exercise_app, name="exercise")
 app.add_typer(equipment_app, name="equipment")
 app.add_typer(history_app, name="history")
 app.add_typer(sheets_app, name="sheets")
+app.add_typer(user_app, name="user")
+user_app.add_typer(profile_app, name="profile")
+app.add_typer(identity_app, name="identity")
+app.add_typer(cardio_app, name="cardio")
+app.add_typer(calories_app, name="calories")
 
 
 def _service() -> GymService:
@@ -61,6 +71,12 @@ def workout_scheduled_begin() -> None:
 def workout_current() -> None:
     """Show the active workout."""
     _run(_service().current_workout)
+
+
+@workout_app.command("substitute")
+def workout_substitute(exercise: Annotated[str, typer.Option("--exercise")]) -> None:
+    """Replace an unlogged prescription with a compatible exercise."""
+    _run(_service().substitute_exercise, exercise)
 
 
 @workout_app.command("complete")
@@ -184,6 +200,148 @@ def equipment_remove(name: str) -> None:
 def history_recent(limit: Annotated[int, typer.Option("--limit")] = 10) -> None:
     """Show recent workout history."""
     _run(_service().recent_history, limit)
+
+
+@history_app.command("summary")
+def history_summary(
+    user: Annotated[str, typer.Option("--user")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Summarize user history from recorded workout results."""
+    del json_output
+    _run(_service().history_summary, user)
+
+
+@user_app.command("list")
+def user_list(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List active users."""
+    del json_output
+    _run(_service().list_users)
+
+
+@user_app.command("show")
+def user_show(user: str, json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Show one user without sensitive profile fields."""
+    del json_output
+    _run(_service().show_user, user)
+
+
+@profile_app.command("set")
+def profile_set(
+    user: str,
+    height: Annotated[str, typer.Option("--height")],
+    weight: Annotated[str, typer.Option("--weight")],
+    birth_date: Annotated[str, typer.Option("--birth-date")],
+    bmr_sex: Annotated[str, typer.Option("--bmr-sex")],
+    baseline_factor: Annotated[str, typer.Option("--baseline-factor")] = "1.20",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Set a normalized metabolic profile."""
+    del json_output
+    _run(
+        _service().set_profile, user, height, weight, birth_date, bmr_sex, Decimal(baseline_factor)
+    )
+
+
+@profile_app.command("show")
+def profile_show(user: str, json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Show an explicitly requested metabolic profile."""
+    del json_output
+    _run(_service().profile, user)
+
+
+@identity_app.command("map")
+def identity_map(
+    platform: Annotated[str, typer.Option("--platform")],
+    sender_id: Annotated[str, typer.Option("--sender-id")],
+    user: Annotated[str, typer.Option("--user")],
+    display_hint: Annotated[str | None, typer.Option("--display-hint")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Bind a platform identity to a user."""
+    del json_output
+    _run(_service().map_identity, platform, sender_id, user, display_hint)
+
+
+@identity_app.command("resolve")
+def identity_resolve(
+    platform: Annotated[str, typer.Option("--platform")],
+    sender_id: Annotated[str, typer.Option("--sender-id")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Resolve a platform identity deterministically."""
+    del json_output
+    _run(_service().resolve_identity, platform, sender_id)
+
+
+@cardio_app.command("log")
+def cardio_log(
+    user: Annotated[str, typer.Option("--user")],
+    activity: Annotated[str, typer.Option("--activity")],
+    duration: Annotated[str, typer.Option("--duration")],
+    rpe: Annotated[int, typer.Option("--rpe")],
+    activity_date: Annotated[str, typer.Option("--date")],
+    distance: Annotated[str | None, typer.Option("--distance")] = None,
+    elevation_gain: Annotated[str | None, typer.Option("--elevation-gain")] = None,
+    source: Annotated[str, typer.Option("--source")] = "manual",
+    source_external_id: Annotated[str | None, typer.Option("--source-external-id")] = None,
+    source_message_id: Annotated[str | None, typer.Option("--source-message-id")] = None,
+    notes: Annotated[str, typer.Option("--notes")] = "",
+    submitted_by: Annotated[str | None, typer.Option("--submitted-by")] = None,
+    imported_calories: Annotated[str | None, typer.Option("--imported-calories")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Log one validated cardio activity."""
+    del json_output
+    _run(
+        _service().log_cardio,
+        user=user,
+        activity=activity,
+        duration=duration,
+        rpe=rpe,
+        activity_date=activity_date,
+        distance=distance,
+        elevation_gain=elevation_gain,
+        source=source,
+        source_external_id=source_external_id,
+        source_message_id=source_message_id,
+        notes=notes,
+        submitted_by=submitted_by,
+        imported_calories=None if imported_calories is None else Decimal(imported_calories),
+    )
+
+
+@cardio_app.command("recent")
+def cardio_recent(
+    user: Annotated[str, typer.Option("--user")],
+    limit: Annotated[int, typer.Option("--limit")] = 10,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Show user-scoped cardio history."""
+    del json_output
+    _run(_service().recent_cardio, user, limit)
+
+
+@calories_app.command("bmr")
+def calories_bmr(
+    user: str,
+    activity_date: Annotated[str, typer.Option("--date")] = "today",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Calculate one user's BMR for a date."""
+    del json_output
+    _run(_service().bmr, user, activity_date)
+
+
+@calories_app.command("day")
+def calories_day(
+    user: Annotated[str, typer.Option("--user")],
+    activity_date: Annotated[str, typer.Option("--date")] = "today",
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Return estimated daily burn components."""
+    del json_output
+    _run(_service().daily_calories, user, activity_date)
 
 
 @sheets_app.command("status")

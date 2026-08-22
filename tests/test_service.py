@@ -66,6 +66,102 @@ def test_recommendations_match_orientation_and_exclude_unavailable_equipment(
     }
 
 
+def test_third_performed_workout_uses_prior_results_for_weights(
+    service: GymService,
+) -> None:
+    first = service.begin_workout()
+    assert first["workout_number"] == 1
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5), final_rir=1)
+    service.complete_workout()
+
+    second = service.begin_workout()
+    assert second["workout_number"] == 2
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5), final_rir=1)
+    service.complete_workout()
+
+    third = service.begin_workout()
+
+    assert third["workout_number"] == 3
+    assert {item["weight"] for item in third["recommendations"]} == {100}
+    assert {item["weight_status"] for item in third["recommendations"]} == {"known"}
+    assert {tuple(item["previous_set_weights"]) for item in third["recommendations"]} == {
+        (90, 90, 90)
+    }
+
+
+def test_prior_final_set_is_baseline_without_equipment(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+    for category in Category:
+        service.add_exercise(f"vertical {category}", category, Orientation.VERTICAL, "free_weight")
+        service.add_exercise(
+            f"horizontal {category}", category, Orientation.HORIZONTAL, "free_weight"
+        )
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(
+            f"vertical {category}",
+            (Decimal(45), Decimal(45), Decimal(65)),
+            (5, 5, 5),
+        )
+    service.complete_workout()
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(50), (5, 5, 5))
+    service.complete_workout()
+
+    recommendation = service.begin_workout()["recommendations"][0]
+
+    assert recommendation["weight"] == 65
+    assert recommendation["previous_set_weights"] == [45, 45, 65]
+
+
+def test_current_workout_recovers_legacy_null_prescription(service: GymService) -> None:
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+    service.begin_workout()
+    with service.database.connect() as connection:
+        connection.execute(
+            """UPDATE workout_exercises SET prescribed_weight=NULL
+            WHERE workout_session_id=(SELECT id FROM workout_sessions WHERE status='active')"""
+        )
+
+    current = service.current_workout()
+
+    assert {item["weight"] for item in current["recommendations"]} == {90}
+    assert {item["weight_status"] for item in current["recommendations"]} == {"known"}
+
+
+def test_substitute_replaces_same_category_before_logging(service: GymService) -> None:
+    service.begin_workout()
+    service.add_exercise(
+        "standing dumbbell shoulder press",
+        Category.PUSH,
+        Orientation.VERTICAL,
+        "dumbbell",
+    )
+    result = service.substitute_exercise("standing dumbbell shoulder press")
+    logged = service.log_exercise("standing dumbbell shoulder press", Decimal(20), (5, 5, 5))
+
+    assert result["replaced"] == "vertical push"
+    assert result["exercise"] == "standing dumbbell shoulder press"
+    assert logged["set_weights"] == [20, 20, 20]
+
+
+def test_substitute_rejects_different_orientation(service: GymService) -> None:
+    service.begin_workout()
+
+    with pytest.raises(GymError, match="orientation"):
+        service.substitute_exercise("horizontal push")
+
+
 def test_completion_requires_all_categories(service: GymService) -> None:
     service.begin_workout()
     service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=0)
@@ -73,7 +169,9 @@ def test_completion_requires_all_categories(service: GymService) -> None:
         service.complete_workout()
     service.log_exercise("vertical pull", Decimal(90), (5, 5, 5), final_rir=1)
     service.log_exercise("vertical legs", Decimal(90), (5, 5, 4), final_rir=0)
-    assert service.complete_workout()["status"] == "completed"
+    completed = service.complete_workout()
+    assert completed["status"] == "completed"
+    assert completed["workout_number"] == 1
 
 
 def test_logging_respects_increment_and_progression(service: GymService) -> None:
@@ -125,8 +223,140 @@ def test_history_and_input_boundaries(service: GymService) -> None:
         service.log_exercise("vertical push", Decimal(90), (5, -1, 5))
 
 
+def test_history_summary_counts_recorded_sets_not_lifecycle_shells(
+    service: GymService,
+) -> None:
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+    service.complete_workout()
+
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+    with service.database.connect() as connection:
+        connection.execute(
+            """INSERT INTO workout_sessions
+            (started_at,local_date,source,orientation,status,user_id)
+            VALUES('2026-08-20T09:00:00-07:00','2026-08-20','manual','vertical','skipped',1)"""
+        )
+
+    result = service.history_summary("geoff")
+
+    assert result["strength"] == {
+        "workouts": 2,
+        "exercises": 6,
+        "sets": 18,
+        "raw_session_rows": 3,
+        "status_counts": {"active": 1, "completed": 1},
+    }
+    assert result["cardio_sessions"] == 0
+
+
 def test_unknown_entities_are_clear_errors(service: GymService) -> None:
     with pytest.raises(GymError, match="unknown equipment"):
         service.remove_equipment("missing")
     with pytest.raises(GymError, match="unknown exercise"):
         service.add_alias("alias", "missing")
+
+
+def test_legacy_database_migrates_every_workout_to_geoff(tmp_path: Path) -> None:
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """CREATE TABLE workout_sessions (
+        id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
+        local_date TEXT NOT NULL, source TEXT NOT NULL, orientation TEXT NOT NULL,
+        status TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '');
+        INSERT INTO workout_sessions VALUES
+        (7,'2026-08-01T10:00:00-07:00',NULL,'2026-08-01','manual','vertical','active','keep');
+        CREATE TABLE workout_exercises (
+        id INTEGER PRIMARY KEY,
+        workout_session_id INTEGER NOT NULL REFERENCES workout_sessions(id));
+        INSERT INTO workout_exercises VALUES(9,7);"""
+    )
+    connection.close()
+    database = Database(path)
+    database.initialize()
+    with database.connect() as migrated:
+        row = migrated.execute(
+            """SELECT ws.id,ws.notes,u.slug FROM workout_sessions ws
+            JOIN users u ON u.id=ws.user_id"""
+        ).fetchone()
+        nullable = next(
+            item["notnull"]
+            for item in migrated.execute("PRAGMA table_info(workout_sessions)")
+            if item["name"] == "user_id"
+        )
+        foreign_keys = migrated.execute("PRAGMA foreign_key_check").fetchall()
+    assert dict(row) == {"id": 7, "notes": "keep", "slug": "geoff"}
+    assert nullable == 1
+    assert foreign_keys == []
+
+
+def test_users_identity_profiles_cardio_and_daily_energy_are_isolated(
+    service: GymService,
+) -> None:
+    assert [user["slug"] for user in service.list_users()["users"]] == ["freedom", "geoff"]
+    service.map_identity("discord", "579188864804192268", "geoff", "Geoff")
+    assert service.resolve_identity("discord", "579188864804192268")["user"] == "geoff"
+    assert service.resolve_identity("discord", "unknown")["requires_clarification"] is True
+    service.set_profile("freedom", "5ft 6in", "150 lb", "1987-04-12", "female")
+    logged = service.log_cardio(
+        user="freedom",
+        activity="hike",
+        duration="41m",
+        distance="1.41 mi",
+        elevation_gain="240 ft",
+        rpe=7,
+        activity_date="2026-08-18",
+        source="alltrails_screenshot",
+        source_message_id="abc",
+        notes="Senador Mine loop",
+        submitted_by="geoff",
+    )
+    assert logged["user"] == "freedom"
+    assert logged["canonical_activity"] == "hiking"
+    assert logged["net_calories_kcal"] < logged["gross_calories_kcal"]
+    assert service.recent_cardio("geoff")["sessions"] == []
+    assert len(service.recent_cardio("freedom")["sessions"]) == 1
+    duplicate = service.log_cardio(
+        user="freedom",
+        activity="hiking",
+        duration="41m",
+        distance="1.41 mi",
+        elevation_gain="240 ft",
+        rpe=7,
+        activity_date="2026-08-18",
+        source="alltrails_screenshot",
+    )
+    assert duplicate["possible_duplicate"] is True
+    daily = service.daily_calories("freedom", "2026-08-18")
+    assert daily["cardio_net_kcal"] == logged["net_calories_kcal"]
+    assert (
+        abs(daily["estimated_total_kcal"] - (daily["baseline_kcal"] + daily["cardio_net_kcal"]))
+        <= 1
+    )
+    assert daily["strength_net_kcal"] is None
+
+
+def test_imported_calories_take_precedence_and_missing_profile_is_structured(
+    service: GymService,
+) -> None:
+    with pytest.raises(GymError, match="missing profile fields: height_cm,weight_kg,birth_date"):
+        service.daily_calories("freedom", "2026-08-18")
+    service.set_profile("freedom", "66 in", "150 lb", "1987-04-12", "female")
+    result = service.log_cardio(
+        user="freedom",
+        activity="walking",
+        duration="30m",
+        rpe=3,
+        activity_date="2026-08-18",
+        source="health_connect",
+        source_external_id="hc-1",
+        imported_calories=Decimal("222"),
+    )
+    assert result["calorie_method"] == "health_connect"
+    assert service.daily_calories("freedom", "2026-08-18")["cardio_net_kcal"] == 222

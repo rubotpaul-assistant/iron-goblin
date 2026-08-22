@@ -28,6 +28,58 @@ def test_cli_reports_structured_error(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert json.loads(result.stdout)["error"] == "no active workout"
 
 
+def test_history_summary_is_user_scoped_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+
+    result = CliRunner().invoke(app, ["history", "summary", "--user", "geoff", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["user"] == "geoff"
+
+
+def test_workout_substitute_command_is_exposed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "original push",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "machine",
+        ],
+    )
+    runner.invoke(app, ["workout", "begin"])
+    runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "replacement push",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "dumbbell",
+        ],
+    )
+
+    result = runner.invoke(app, ["workout", "substitute", "--exercise", "replacement push"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["exercise"] == "replacement push"
+
+
 def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
     runner = CliRunner()
@@ -132,3 +184,72 @@ def test_cli_accepts_three_set_weights(monkeypatch: pytest.MonkeyPatch, tmp_path
     )
     assert result.exit_code == 0, result.stdout
     assert json.loads(result.stdout)["set_weights"] == [45.0, 45.0, 65.0]
+
+
+def test_cli_multiuser_cardio_energy_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    commands = [
+        ["user", "list", "--json"],
+        [
+            "identity",
+            "map",
+            "--platform",
+            "discord",
+            "--sender-id",
+            "579",
+            "--user",
+            "geoff",
+            "--json",
+        ],
+        ["identity", "resolve", "--platform", "discord", "--sender-id", "579", "--json"],
+        [
+            "user",
+            "profile",
+            "set",
+            "freedom",
+            "--height",
+            "5ft 6in",
+            "--weight",
+            "150 lb",
+            "--birth-date",
+            "1987-04-12",
+            "--bmr-sex",
+            "female",
+            "--json",
+        ],
+        [
+            "cardio",
+            "log",
+            "--user",
+            "freedom",
+            "--activity",
+            "hiking",
+            "--duration",
+            "41m",
+            "--distance",
+            "1.41 mi",
+            "--elevation-gain",
+            "240 ft",
+            "--rpe",
+            "7",
+            "--date",
+            "2026-08-18",
+            "--source",
+            "alltrails_screenshot",
+            "--json",
+        ],
+        ["cardio", "recent", "--user", "freedom", "--json"],
+        ["calories", "bmr", "freedom", "--date", "2026-08-18", "--json"],
+        ["calories", "day", "--user", "freedom", "--date", "2026-08-18", "--json"],
+    ]
+    payloads = []
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.stdout
+        payloads.append(json.loads(result.stdout))
+    assert payloads[2]["user"] == "geoff"
+    assert payloads[4]["canonical_activity"] == "hiking"
+    assert payloads[-1]["label"] == "Estimated daily burn"
