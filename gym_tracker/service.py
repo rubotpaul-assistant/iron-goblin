@@ -385,12 +385,13 @@ class GymService:
         equipment_name: str | None = None,
     ) -> dict[str, Any]:
         """Add a canonical classified exercise and optional equipment requirement."""
+        canonical_name = name.title() if name == name.lower() else name
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO exercises(
                 canonical_name,category,orientation,equipment_type,default_unit
                 ) VALUES(?,?,?,?,?)""",
-                (name, category.value, orientation.value, equipment_type, unit),
+                (canonical_name, category.value, orientation.value, equipment_type, unit),
             )
             exercise_id = int(cursor.lastrowid or 0)
             if equipment_name:
@@ -403,7 +404,7 @@ class GymService:
                     "INSERT INTO exercise_equipment(exercise_id,equipment_id) VALUES(?,?)",
                     (exercise_id, equipment["id"]),
                 )
-        return {"ok": True, "exercise": name, "id": exercise_id}
+        return {"ok": True, "exercise": canonical_name, "id": exercise_id}
 
     def add_alias(self, alias: str, exercise: str) -> dict[str, Any]:
         """Persist a user's wording for a known exercise."""
@@ -430,13 +431,22 @@ class GymService:
     def begin_workout(
         self, *, scheduled: bool = False, now: datetime | None = None
     ) -> dict[str, Any]:
-        """Begin one workout, idempotently for scheduled local dates."""
+        """Begin one workout, carrying an active workout across scheduled dates."""
         timestamp = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC)
         local_date = timestamp.date().isoformat()
         with self.database.connect() as connection:
             existing = self._existing_workout(connection, local_date, scheduled)
             if existing is not None:
-                return self._workout_payload(connection, int(existing["id"]), duplicate=True)
+                return self._workout_payload(
+                    connection,
+                    int(existing["id"]),
+                    duplicate=True,
+                    carried_forward=bool(
+                        scheduled
+                        and existing["status"] == "active"
+                        and existing["local_date"] != local_date
+                    ),
+                )
             latest = connection.execute(
                 "SELECT orientation FROM workout_sessions ORDER BY started_at DESC,id DESC LIMIT 1"
             ).fetchone()
@@ -528,10 +538,16 @@ class GymService:
         unit: str = "lb",
         final_rir: int | None = None,
         technical_failure: bool = False,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically attach a three-set result to the active workout."""
-        if any(repetition < 0 for repetition in reps) or (final_rir is not None and final_rir < 0):
-            raise GymError("reps and RIR must be non-negative")
+        if any(repetition < 0 for repetition in reps):
+            raise GymError("reps must be non-negative")
+        if final_rir is None:
+            raise GymError("final-set RIR is required")
+        if final_rir < 0 or final_rir > 3:
+            raise GymError("final-set RIR must be between 0 and 3")
+        performed_date = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC).date().isoformat()
         set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
         with self.database.connect() as connection:
             workout_exercise = self._active_workout_exercise(connection, exercise)
@@ -560,8 +576,9 @@ class GymService:
                     ),
                 )
             connection.execute(
-                "UPDATE workout_exercises SET status='completed' WHERE id=?",
-                (workout_exercise["id"],),
+                """UPDATE workout_exercises
+                SET status='completed',performed_local_date=? WHERE id=?""",
+                (performed_date, workout_exercise["id"]),
             )
             working_weight = set_weights[-1]
             next_weight, reason = (working_weight, "baseline_recorded")
@@ -572,7 +589,7 @@ class GymService:
             connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
         return {
             "ok": True,
-            "exercise": exercise,
+            "exercise": workout_exercise["canonical_name"],
             "total_reps": sum(reps),
             "set_weights": [float(set_weight) for set_weight in set_weights],
             "next_weight": float(next_weight),
@@ -608,14 +625,24 @@ class GymService:
         }
 
     def skip_workout(self) -> dict[str, Any]:
-        """Skip the active workout while preserving it for alternation."""
+        """Close the active workout as partial when it contains performed results."""
         with self.database.connect() as connection:
-            result = connection.execute(
-                "UPDATE workout_sessions SET status='skipped' WHERE status='active'"
-            )
-            if result.rowcount == 0:
+            workout = connection.execute(
+                "SELECT id FROM workout_sessions WHERE status='active'"
+            ).fetchone()
+            if workout is None:
                 raise GymError("no active workout")
-        return {"ok": True, "status": "skipped"}
+            has_results = connection.execute(
+                """SELECT 1 FROM workout_exercises wx JOIN sets s ON s.workout_exercise_id=wx.id
+                WHERE wx.workout_session_id=? LIMIT 1""",
+                (workout["id"],),
+            ).fetchone()
+            status = "partial" if has_results is not None else "skipped"
+            connection.execute(
+                "UPDATE workout_sessions SET status=? WHERE id=?", (status, workout["id"])
+            )
+            connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {"ok": True, "status": status}
 
     def recent_history(self, limit: int = 10) -> dict[str, Any]:
         """Return recent workout sessions."""
@@ -639,7 +666,8 @@ class GymService:
                 ).fetchone()[0]
             )
             workout_rows = connection.execute(
-                """SELECT ws.id,ws.local_date,ws.orientation,ws.status,
+                """SELECT ws.id,COALESCE(MIN(wx.performed_local_date),ws.local_date) AS local_date,
+                ws.orientation,ws.status,
                 COUNT(DISTINCT wx.id) AS exercises,COUNT(s.id) AS sets
                 FROM workout_sessions ws
                 JOIN workout_exercises wx ON wx.workout_session_id=ws.id
@@ -672,6 +700,44 @@ class GymService:
             },
             "cardio_sessions": cardio_sessions,
             "workouts": workouts,
+        }
+
+    def correct_workout_date(
+        self, user: str, workout_number: int, requested_date: str
+    ) -> dict[str, Any]:
+        """Correct the performed date for one recorded workout through a governed command."""
+        if workout_number < 1:
+            raise GymError("workout number must be at least 1")
+        try:
+            corrected_date = date.fromisoformat(requested_date).isoformat()
+        except ValueError as error:
+            raise GymError("date must use YYYY-MM-DD") from error
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            workouts = connection.execute(
+                """SELECT ws.id FROM workout_sessions ws WHERE ws.user_id=? AND EXISTS(
+                 SELECT 1 FROM workout_exercises wx JOIN sets s ON s.workout_exercise_id=wx.id
+                 WHERE wx.workout_session_id=ws.id)
+                ORDER BY ws.started_at,ws.id""",
+                (user_id,),
+            ).fetchall()
+            if workout_number > len(workouts):
+                raise GymError(f"unknown performed workout number: {workout_number}")
+            workout_id = int(workouts[workout_number - 1]["id"])
+            result = connection.execute(
+                """UPDATE workout_exercises SET performed_local_date=?
+                WHERE workout_session_id=? AND status='completed' AND EXISTS(
+                 SELECT 1 FROM sets WHERE sets.workout_exercise_id=workout_exercises.id)""",
+                (corrected_date, workout_id),
+            )
+            connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {
+            "ok": True,
+            "user": user,
+            "workout_number": workout_number,
+            "date": corrected_date,
+            "exercises_updated": result.rowcount,
+            "sync_pending": True,
         }
 
     def _exercise_id(self, name: str) -> int:
@@ -724,18 +790,21 @@ class GymService:
     def _existing_workout(
         connection: sqlite3.Connection, local_date: str, scheduled: bool
     ) -> sqlite3.Row | None:
+        active = connection.execute(
+            "SELECT id,local_date,status FROM workout_sessions WHERE status='active'"
+        ).fetchone()
+        if active is not None:
+            return cast("sqlite3.Row", active)
         if scheduled:
             return cast(
                 "sqlite3.Row | None",
                 connection.execute(
-                    "SELECT id FROM workout_sessions WHERE local_date=? AND source='scheduled'",
+                    """SELECT id,local_date,status FROM workout_sessions
+                    WHERE local_date=? AND source='scheduled'""",
                     (local_date,),
                 ).fetchone(),
             )
-        return cast(
-            "sqlite3.Row | None",
-            connection.execute("SELECT id FROM workout_sessions WHERE status='active'").fetchone(),
-        )
+        return None
 
     def _prescribe(
         self, connection: sqlite3.Connection, workout_id: int, orientation: Orientation
@@ -802,7 +871,12 @@ class GymService:
         return float(prescribed_weight), previous_weights
 
     def _workout_payload(
-        self, connection: sqlite3.Connection, workout_id: int, *, duplicate: bool
+        self,
+        connection: sqlite3.Connection,
+        workout_id: int,
+        *,
+        duplicate: bool,
+        carried_forward: bool = False,
     ) -> dict[str, Any]:
         workout = connection.execute(
             "SELECT * FROM workout_sessions WHERE id=?", (workout_id,)
@@ -841,6 +915,7 @@ class GymService:
             "orientation": workout["orientation"],
             "status": workout["status"],
             "duplicate": duplicate,
+            "carried_forward": carried_forward,
             "remaining_categories": self._remaining(connection, workout_id),
             "recommendations": recommendation_payloads,
         }
@@ -887,8 +962,10 @@ class GymService:
     ) -> sqlite3.Row:
         exercise_id = self._exercise_id(exercise)
         row = connection.execute(
-            """SELECT wx.id,wx.exercise_id FROM workout_exercises wx JOIN workout_sessions ws
-            ON ws.id=wx.workout_session_id WHERE ws.status='active' AND wx.exercise_id=?""",
+            """SELECT wx.id,wx.exercise_id,e.canonical_name
+            FROM workout_exercises wx JOIN workout_sessions ws
+            ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
+            WHERE ws.status='active' AND wx.exercise_id=?""",
             (exercise_id,),
         ).fetchone()
         if row is None:

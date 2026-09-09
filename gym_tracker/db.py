@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS workout_sessions (
  id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
  local_date TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
  orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
- status TEXT NOT NULL CHECK(status IN ('planned','active','completed','skipped')),
+ status TEXT NOT NULL CHECK(status IN ('planned','active','partial','completed','skipped')),
  notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_day
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS workout_exercises (
  id INTEGER PRIMARY KEY, workout_session_id INTEGER NOT NULL REFERENCES workout_sessions(id),
  exercise_id INTEGER NOT NULL REFERENCES exercises(id), prescribed_weight REAL,
  unit TEXT NOT NULL, sequence INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'prescribed',
+ performed_local_date TEXT,
  UNIQUE(workout_session_id,exercise_id), UNIQUE(workout_session_id,sequence)
 );
 CREATE TABLE IF NOT EXISTS sets (
@@ -116,21 +117,54 @@ class Database:
         self._migrate_legacy_workouts()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {
+                str(column["name"])
+                for column in connection.execute("PRAGMA table_info(workout_exercises)")
+            }
+            if "performed_local_date" not in columns:
+                connection.execute(
+                    "ALTER TABLE workout_exercises ADD COLUMN performed_local_date TEXT"
+                )
+            if "status" in columns:
+                connection.execute(
+                    """UPDATE workout_exercises SET performed_local_date=(
+                     SELECT local_date FROM workout_sessions
+                     WHERE workout_sessions.id=workout_exercises.workout_session_id)
+                    WHERE status='completed' AND performed_local_date IS NULL AND EXISTS(
+                     SELECT 1 FROM sets WHERE sets.workout_exercise_id=workout_exercises.id)"""
+                )
+            connection.execute(
+                """UPDATE workout_sessions SET status='partial' WHERE status='skipped' AND EXISTS(
+                 SELECT 1 FROM workout_exercises wx JOIN sets s ON s.workout_exercise_id=wx.id
+                 WHERE wx.workout_session_id=workout_sessions.id)"""
+            )
+            names = connection.execute("SELECT id,canonical_name FROM exercises").fetchall()
+            for exercise in names:
+                name = str(exercise["canonical_name"])
+                if name == name.lower():
+                    connection.execute(
+                        "UPDATE exercises SET canonical_name=? WHERE id=?",
+                        (name.title(), exercise["id"]),
+                    )
 
     def _migrate_legacy_workouts(self) -> None:
         """Restart-safely rebuild the legacy parent with non-null Geoff ownership."""
         connection = sqlite3.connect(self.path)
         try:
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workout_sessions'"
+            existing_table = connection.execute(
+                """SELECT sql FROM sqlite_master
+                WHERE type='table' AND name='workout_sessions'"""
             ).fetchone()
             columns = (
                 []
-                if exists is None
+                if existing_table is None
                 else connection.execute("PRAGMA table_info(workout_sessions)").fetchall()
             )
             user_column = next((column for column in columns if column[1] == "user_id"), None)
-            if exists is None or (user_column is not None and user_column[3] == 1):
+            supports_partial = existing_table is not None and "'partial'" in existing_table[0]
+            if existing_table is None or (
+                user_column is not None and user_column[3] == 1 and supports_partial
+            ):
                 return
             connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("PRAGMA legacy_alter_table = ON")
@@ -148,7 +182,8 @@ class Database:
                  local_date TEXT NOT NULL,
                  source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
                  orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
-                 status TEXT NOT NULL CHECK(status IN ('planned','active','completed','skipped')),
+                 status TEXT NOT NULL CHECK(
+                  status IN ('planned','active','partial','completed','skipped')),
                  notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));"""
             )
             if user_column is None:

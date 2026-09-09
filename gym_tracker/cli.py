@@ -95,10 +95,10 @@ def workout_skip() -> None:
 def log_exercise(
     exercise: Annotated[str, typer.Option("--exercise")],
     reps: Annotated[str, typer.Option("--reps")],
+    final_set_rir: Annotated[int, typer.Option("--final-set-rir")],
     weight: Annotated[str | None, typer.Option("--weight")] = None,
     weights: Annotated[str | None, typer.Option("--weights")] = None,
     unit: Annotated[str, typer.Option("--unit")] = "lb",
-    final_set_rir: Annotated[int | None, typer.Option("--final-set-rir")] = None,
     technical_failure: Annotated[bool, typer.Option("--technical-failure")] = False,
 ) -> None:
     """Log one three-set exercise result."""
@@ -136,6 +136,16 @@ def log_exercise(
         final_set_rir,
         technical_failure,
     )
+
+
+@history_app.command("correct-date")
+def history_correct_date(
+    user: Annotated[str, typer.Option("--user")],
+    workout_number: Annotated[int, typer.Option("--workout-number")],
+    activity_date: Annotated[str, typer.Option("--date")],
+) -> None:
+    """Correct the local performance date for one recorded workout."""
+    _run(_service().correct_workout_date, user, workout_number, activity_date)
 
 
 @exercise_app.command("add")

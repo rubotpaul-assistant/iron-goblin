@@ -77,7 +77,7 @@ def test_workout_substitute_command_is_exposed(
     result = runner.invoke(app, ["workout", "substitute", "--exercise", "replacement push"])
 
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["exercise"] == "replacement push"
+    assert json.loads(result.stdout)["exercise"] == "Replacement Push"
 
 
 def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -141,7 +141,19 @@ def test_cli_rejects_invalid_reps(
 ) -> None:
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
     result = CliRunner().invoke(
-        app, ["log", "exercise", "--exercise", "press", "--weight", "50", "--reps", reps]
+        app,
+        [
+            "log",
+            "exercise",
+            "--exercise",
+            "press",
+            "--weight",
+            "50",
+            "--reps",
+            reps,
+            "--final-set-rir",
+            "1",
+        ],
     )
     assert result.exit_code == 1
     assert "three" in json.loads(result.stdout)["error"]
@@ -180,10 +192,78 @@ def test_cli_accepts_three_set_weights(monkeypatch: pytest.MonkeyPatch, tmp_path
             "45,45,65",
             "--reps",
             "5,5,5",
+            "--final-set-rir",
+            "1",
         ],
     )
     assert result.exit_code == 0, result.stdout
     assert json.loads(result.stdout)["set_weights"] == [45.0, 45.0, 65.0]
+
+
+def test_cli_requires_final_set_rir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+
+    result = CliRunner().invoke(
+        app, ["log", "exercise", "--exercise", "press", "--weight", "50", "--reps", "5,5,5"]
+    )
+
+    assert result.exit_code == 2
+    assert "--final-set-rir" in result.output
+
+
+def test_cli_corrects_performed_workout_date(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "press",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "dumbbell",
+        ],
+    )
+    runner.invoke(app, ["workout", "begin"])
+    runner.invoke(
+        app,
+        [
+            "log",
+            "exercise",
+            "--exercise",
+            "press",
+            "--weight",
+            "10",
+            "--reps",
+            "5,5,5",
+            "--final-set-rir",
+            "1",
+        ],
+    )
+    runner.invoke(app, ["workout", "skip"])
+
+    result = runner.invoke(
+        app,
+        [
+            "history",
+            "correct-date",
+            "--user",
+            "geoff",
+            "--workout-number",
+            "1",
+            "--date",
+            "2026-09-08",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["exercises_updated"] == 1
 
 
 def test_cli_multiuser_cardio_energy_contract(

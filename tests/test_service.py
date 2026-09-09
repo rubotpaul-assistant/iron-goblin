@@ -53,6 +53,96 @@ def test_scheduled_begin_is_idempotent_for_pacific_date(service: GymService) -> 
     assert second["duplicate"] is True
 
 
+def test_scheduled_begin_carries_forward_an_older_active_workout(
+    service: GymService,
+) -> None:
+    monday = datetime(2026, 8, 24, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+    thursday = datetime(2026, 8, 27, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+    pending = service.begin_workout(scheduled=True, now=monday)
+
+    carried = service.begin_workout(scheduled=True, now=thursday)
+
+    assert carried["workout_id"] == pending["workout_id"]
+    assert carried["duplicate"] is True
+    assert carried["carried_forward"] is True
+    assert carried["remaining_categories"] == ["push", "pull", "legs"]
+
+
+def test_logging_records_performance_date_in_pacific_time(service: GymService) -> None:
+    service.begin_workout(now=datetime(2026, 8, 24, 12, tzinfo=ZoneInfo("America/Los_Angeles")))
+
+    service.log_exercise(
+        "vertical push",
+        Decimal(90),
+        (5, 5, 5),
+        final_rir=1,
+        now=datetime(2026, 9, 8, 23, 30, tzinfo=ZoneInfo("America/Los_Angeles")),
+    )
+
+    with service.database.connect() as connection:
+        performed_date = connection.execute(
+            "SELECT performed_local_date FROM workout_exercises WHERE status='completed'"
+        ).fetchone()[0]
+    assert performed_date == "2026-09-08"
+
+
+def test_history_date_correction_uses_performed_workout_number(service: GymService) -> None:
+    service.begin_workout()
+    service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=1)
+    service.skip_workout()
+
+    corrected = service.correct_workout_date("geoff", 1, "2026-09-08")
+
+    assert corrected == {
+        "ok": True,
+        "user": "geoff",
+        "workout_number": 1,
+        "date": "2026-09-08",
+        "exercises_updated": 1,
+        "sync_pending": True,
+    }
+
+    with pytest.raises(GymError, match="at least 1"):
+        service.correct_workout_date("geoff", 0, "2026-09-08")
+    with pytest.raises(GymError, match="YYYY-MM-DD"):
+        service.correct_workout_date("geoff", 1, "September 8")
+    with pytest.raises(GymError, match="unknown performed workout"):
+        service.correct_workout_date("geoff", 2, "2026-09-08")
+
+
+def test_skip_distinguishes_empty_and_partial_workouts(service: GymService) -> None:
+    service.begin_workout()
+    assert service.skip_workout()["status"] == "skipped"
+    service.begin_workout()
+    service.log_exercise("horizontal push", Decimal(90), (5, 5, 5), final_rir=1)
+
+    assert service.skip_workout()["status"] == "partial"
+
+
+def test_final_set_rir_is_required_and_bounded(service: GymService) -> None:
+    service.begin_workout()
+    with pytest.raises(GymError, match="required"):
+        service.log_exercise("vertical push", Decimal(90), (5, 5, 5))
+    with pytest.raises(GymError, match="between 0 and 3"):
+        service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=4)
+
+
+def test_all_lowercase_exercise_names_are_canonicalized_to_title_case(
+    service: GymService,
+) -> None:
+    result = service.add_exercise(
+        "standing dumbbell shoulder press",
+        Category.PUSH,
+        Orientation.VERTICAL,
+        "dumbbell",
+    )
+
+    assert result["exercise"] == "Standing Dumbbell Shoulder Press"
+    assert service.search_exercises("standing")["matches"][0]["canonical_name"] == (
+        "Standing Dumbbell Shoulder Press"
+    )
+
+
 def test_recommendations_match_orientation_and_exclude_unavailable_equipment(
     service: GymService,
 ) -> None:
@@ -61,8 +151,8 @@ def test_recommendations_match_orientation_and_exclude_unavailable_equipment(
     categories = {recommendation["category"] for recommendation in workout["recommendations"]}
     assert "push" not in categories
     assert {item["exercise"] for item in workout["recommendations"]} == {
-        "vertical pull",
-        "vertical legs",
+        "Vertical Pull",
+        "Vertical Legs",
     }
 
 
@@ -104,11 +194,12 @@ def test_prior_final_set_is_baseline_without_equipment(tmp_path: Path) -> None:
             f"vertical {category}",
             (Decimal(45), Decimal(45), Decimal(65)),
             (5, 5, 5),
+            final_rir=1,
         )
     service.complete_workout()
     service.begin_workout()
     for category in Category:
-        service.log_exercise(f"horizontal {category}", Decimal(50), (5, 5, 5))
+        service.log_exercise(f"horizontal {category}", Decimal(50), (5, 5, 5), final_rir=1)
     service.complete_workout()
 
     recommendation = service.begin_workout()["recommendations"][0]
@@ -120,11 +211,11 @@ def test_prior_final_set_is_baseline_without_equipment(tmp_path: Path) -> None:
 def test_current_workout_recovers_legacy_null_prescription(service: GymService) -> None:
     service.begin_workout()
     for category in Category:
-        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5), final_rir=0)
     service.complete_workout()
     service.begin_workout()
     for category in Category:
-        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5), final_rir=0)
     service.complete_workout()
     service.begin_workout()
     with service.database.connect() as connection:
@@ -148,10 +239,12 @@ def test_substitute_replaces_same_category_before_logging(service: GymService) -
         "dumbbell",
     )
     result = service.substitute_exercise("standing dumbbell shoulder press")
-    logged = service.log_exercise("standing dumbbell shoulder press", Decimal(20), (5, 5, 5))
+    logged = service.log_exercise(
+        "standing dumbbell shoulder press", Decimal(20), (5, 5, 5), final_rir=1
+    )
 
-    assert result["replaced"] == "vertical push"
-    assert result["exercise"] == "standing dumbbell shoulder press"
+    assert result["replaced"] == "Vertical Push"
+    assert result["exercise"] == "Standing Dumbbell Shoulder Press"
     assert logged["set_weights"] == [20, 20, 20]
 
 
@@ -190,6 +283,7 @@ def test_logging_preserves_independent_weight_for_each_set(service: GymService) 
         "vertical legs",
         (Decimal(40), Decimal(40), Decimal(60)),
         (5, 5, 5),
+        final_rir=0,
     )
     with service.database.connect() as connection:
         weights = connection.execute(
@@ -207,10 +301,10 @@ def test_aliases_resolve_consistently(service: GymService) -> None:
     service.add_alias("pushy up thing", "vertical push")
     assert (
         service.search_exercises("pushy up thing")["matches"][0]["canonical_name"]
-        == "vertical push"
+        == "Vertical Push"
     )
     service.begin_workout()
-    assert service.log_exercise("pushy up thing", Decimal(90), (5, 5, 5))["ok"] is True
+    assert service.log_exercise("pushy up thing", Decimal(90), (5, 5, 5), final_rir=1)["ok"] is True
 
 
 def test_history_and_input_boundaries(service: GymService) -> None:
@@ -220,7 +314,7 @@ def test_history_and_input_boundaries(service: GymService) -> None:
     with pytest.raises(GymError, match="between 1 and 100"):
         service.recent_history(0)
     with pytest.raises(GymError, match="non-negative"):
-        service.log_exercise("vertical push", Decimal(90), (5, -1, 5))
+        service.log_exercise("vertical push", Decimal(90), (5, -1, 5), final_rir=1)
 
 
 def test_history_summary_counts_recorded_sets_not_lifecycle_shells(
@@ -228,12 +322,12 @@ def test_history_summary_counts_recorded_sets_not_lifecycle_shells(
 ) -> None:
     service.begin_workout()
     for category in Category:
-        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5))
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5), final_rir=1)
     service.complete_workout()
 
     service.begin_workout()
     for category in Category:
-        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5))
+        service.log_exercise(f"horizontal {category}", Decimal(90), (5, 5, 5), final_rir=1)
     with service.database.connect() as connection:
         connection.execute(
             """INSERT INTO workout_sessions

@@ -21,6 +21,9 @@ class SheetsWriter(Protocol):
     def replace_rows(self, spreadsheet_id: str, tab: str, rows: list[list[Any]]) -> None:
         """Replace a tab with normalized rows."""
 
+    def delete_tab(self, spreadsheet_id: str, tab: str) -> None:
+        """Delete one exact deprecated projection tab when present."""
+
 
 class SheetsService:
     """Project workout history to Sheets without controlling persistence."""
@@ -54,6 +57,7 @@ class SheetsService:
                 }
             for tab, rows in tabs.items():
                 self.writer.replace_rows(self.spreadsheet_id, tab, rows)
+            self.writer.delete_tab(self.spreadsheet_id, "Workout History")
         except Exception as error:
             with self.database.connect() as connection:
                 connection.execute(
@@ -80,11 +84,14 @@ class SheetsService:
         header = [
             "Date",
             "User",
-            "Workout ID",
+            "Workout Number",
+            "Workout Status",
             "Orientation",
             "Category",
             "Exercise",
-            "Weight",
+            "Set 1 Weight",
+            "Set 2 Weight",
+            "Set 3 Weight",
             "Unit",
             "Set 1",
             "Set 2",
@@ -95,15 +102,28 @@ class SheetsService:
             "Notes",
         ]
         records = connection.execute(
-            """SELECT ws.local_date,u.display_name,ws.id,ws.orientation,e.category,e.canonical_name,
-            MAX(s.weight),MAX(s.unit),MAX(CASE WHEN s.set_number=1 THEN s.completed_reps END),
+            """WITH performed_workouts AS (
+             SELECT ws.id,ROW_NUMBER() OVER (
+              PARTITION BY ws.user_id ORDER BY ws.started_at,ws.id) AS workout_number
+             FROM workout_sessions ws WHERE EXISTS(
+              SELECT 1 FROM workout_exercises performed
+              JOIN sets recorded ON recorded.workout_exercise_id=performed.id
+              WHERE performed.workout_session_id=ws.id))
+            SELECT COALESCE(wx.performed_local_date,ws.local_date),u.display_name,
+            performed_workouts.workout_number,ws.status,ws.orientation,e.category,e.canonical_name,
+            MAX(CASE WHEN s.set_number=1 THEN s.weight END),
+            MAX(CASE WHEN s.set_number=2 THEN s.weight END),
+            MAX(CASE WHEN s.set_number=3 THEN s.weight END),MAX(s.unit),
+            MAX(CASE WHEN s.set_number=1 THEN s.completed_reps END),
             MAX(CASE WHEN s.set_number=2 THEN s.completed_reps END),
             MAX(CASE WHEN s.set_number=3 THEN s.completed_reps END),
-            COALESCE(SUM(s.completed_reps),0),
+            SUM(s.completed_reps),
             MAX(CASE WHEN s.set_number=3 THEN s.rir END),MAX(s.technical_failure),ws.notes
             FROM workout_sessions ws JOIN users u ON u.id=ws.user_id
+            JOIN performed_workouts ON performed_workouts.id=ws.id
             JOIN workout_exercises wx ON wx.workout_session_id=ws.id
-            JOIN exercises e ON e.id=wx.exercise_id LEFT JOIN sets s ON s.workout_exercise_id=wx.id
+            JOIN exercises e ON e.id=wx.exercise_id JOIN sets s ON s.workout_exercise_id=wx.id
+            WHERE wx.status='completed'
             GROUP BY ws.id,wx.id ORDER BY ws.started_at,wx.sequence"""
         ).fetchall()
         return [header, *[list(record) for record in records]]
@@ -257,3 +277,26 @@ class GoogleSheetsWriter:
             valueInputOption="RAW",
             body={"values": rows},
         ).execute()
+
+    def delete_tab(self, spreadsheet_id: str, tab: str) -> None:
+        """Delete an exact legacy projection tab and leave unrelated tabs untouched."""
+        build = cast("Any", import_module("googleapiclient.discovery").build)
+        service = build("sheets", "v4", credentials=self._credentials(), cache_discovery=False)
+        metadata = (
+            service.spreadsheets()
+            .get(spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)")
+            .execute()
+        )
+        matching = next(
+            (
+                sheet["properties"]["sheetId"]
+                for sheet in metadata.get("sheets", [])
+                if sheet["properties"]["title"] == tab
+            ),
+            None,
+        )
+        if matching is not None:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": [{"deleteSheet": {"sheetId": matching}}]},
+            ).execute()
