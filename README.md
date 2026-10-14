@@ -39,7 +39,8 @@ gym workout log-bodyweight --user geoff --date 2026-10-13 \
 
 Every exercise must already exist with equipment type `bodyweight`. Exact retries return the
 existing workout with `duplicate: true` instead of writing a second session. Mixed sessions do not
-alter horizontal/vertical workout alternation.
+alter horizontal/vertical workout alternation. Each comma-separated `--reps` value may contain
+between one and twenty sets; final-set RIR is attached to its last set.
 
 Use `gym history correct-date --user <slug> --workout-number <n> --date YYYY-MM-DD` to repair
 a legacy performance date through the governed CLI. Strength logging requires final-set RIR from

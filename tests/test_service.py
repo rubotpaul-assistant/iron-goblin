@@ -79,7 +79,7 @@ def test_backdated_bodyweight_workout_is_atomic_mixed_and_deduplicated(
     )
     results = (
         ("Push-Up", (6, 6, 6), 3),
-        ("Bodyweight Squat", (10, 10, 10), 3),
+        ("Bodyweight Squat", (8, 8, 8, 8), 3),
     )
 
     logged = service.log_bodyweight_workout(
@@ -102,7 +102,7 @@ def test_backdated_bodyweight_workout_is_atomic_mixed_and_deduplicated(
             {"exercise": "Push-Up", "reps": [6, 6, 6], "final_set_rir": 3},
             {
                 "exercise": "Bodyweight Squat",
-                "reps": [10, 10, 10],
+                "reps": [8, 8, 8, 8],
                 "final_set_rir": 3,
             },
         ],
@@ -127,9 +127,10 @@ def test_backdated_bodyweight_workout_is_atomic_mixed_and_deduplicated(
         ("Push-Up", 6, 0, None),
         ("Push-Up", 6, 0, None),
         ("Push-Up", 6, 0, 3),
-        ("Bodyweight Squat", 10, 0, None),
-        ("Bodyweight Squat", 10, 0, None),
-        ("Bodyweight Squat", 10, 0, 3),
+        ("Bodyweight Squat", 8, 0, None),
+        ("Bodyweight Squat", 8, 0, None),
+        ("Bodyweight Squat", 8, 0, None),
+        ("Bodyweight Squat", 8, 0, 3),
     ]
 
 

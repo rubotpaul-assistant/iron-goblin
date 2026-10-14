@@ -108,13 +108,13 @@ def workout_log_bodyweight(
             )
         )
         return
-    parsed_reps: list[tuple[int, int, int]] = []
+    parsed_reps: list[tuple[int, ...]] = []
     try:
         for value in reps:
             parsed = tuple(int(item.strip()) for item in value.split(","))
-            if len(parsed) != 3:
-                raise GymError("reps must contain exactly three sets per exercise")
-            parsed_reps.append((parsed[0], parsed[1], parsed[2]))
+            if not parsed or len(parsed) > 20:
+                raise GymError("reps must contain between 1 and 20 sets per exercise")
+            parsed_reps.append(parsed)
     except ValueError as error:
         _run(lambda: (_ for _ in ()).throw(GymError("reps must be comma-separated integers")))
         raise AssertionError from error

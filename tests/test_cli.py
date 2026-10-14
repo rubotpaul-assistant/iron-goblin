@@ -315,7 +315,7 @@ def test_cli_logs_backdated_mixed_bodyweight_workout(
             "--exercise",
             "Bodyweight Squat",
             "--reps",
-            "10,10,10",
+            "8,8,8,8",
             "--final-set-rir",
             "3",
             "--notes",
@@ -331,6 +331,7 @@ def test_cli_logs_backdated_mixed_bodyweight_workout(
         "Push-Up",
         "Bodyweight Squat",
     ]
+    assert payload["exercises"][1]["reps"] == [8, 8, 8, 8]
 
 
 def test_cli_rejects_unpaired_bodyweight_results(

@@ -60,7 +60,7 @@ MET_TABLE = {
     "dance": (Decimal("3.0"), Decimal("5.0"), Decimal("7.8")),
     "other_cardio": (Decimal("3.0"), Decimal("5.0"), Decimal("8.0")),
 }
-BodyweightResult = tuple[str, tuple[int, int, int], int]
+BodyweightResult = tuple[str, tuple[int, ...], int]
 
 
 class GymError(Exception):
@@ -552,7 +552,7 @@ class GymService:
                             completed_reps,
                             0,
                             exercise["default_unit"],
-                            final_rir if set_number == 3 else None,
+                            final_rir if set_number == len(reps) else None,
                         ),
                     )
             connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
@@ -839,10 +839,12 @@ class GymService:
     @staticmethod
     def _validate_bodyweight_results(
         connection: sqlite3.Connection, results: tuple[BodyweightResult, ...]
-    ) -> tuple[tuple[sqlite3.Row, tuple[int, int, int], int], ...]:
-        normalized: list[tuple[sqlite3.Row, tuple[int, int, int], int]] = []
+    ) -> tuple[tuple[sqlite3.Row, tuple[int, ...], int], ...]:
+        normalized: list[tuple[sqlite3.Row, tuple[int, ...], int]] = []
         exercise_ids: set[int] = set()
         for name, reps, final_rir in results:
+            if not reps or len(reps) > 20:
+                raise GymError("reps must contain between 1 and 20 sets per exercise")
             if any(repetition < 0 for repetition in reps):
                 raise GymError("reps must be non-negative")
             if final_rir < 0 or final_rir > 3:
@@ -871,7 +873,7 @@ class GymService:
         connection: sqlite3.Connection,
         user_id: int,
         activity_date: str,
-        results: tuple[tuple[sqlite3.Row, tuple[int, int, int], int], ...],
+        results: tuple[tuple[sqlite3.Row, tuple[int, ...], int], ...],
     ) -> int | None:
         expected = tuple(
             (int(exercise["id"]), reps, final_rir) for exercise, reps, final_rir in results
@@ -888,14 +890,17 @@ class GymService:
                 WHERE wx.workout_session_id=? ORDER BY wx.sequence,s.set_number""",
                 (candidate["id"],),
             ).fetchall()
+            grouped: dict[int, list[sqlite3.Row]] = {}
+            for row in rows:
+                grouped.setdefault(int(row["sequence"]), []).append(row)
             actual = tuple(
                 (
-                    int(rows[index]["exercise_id"]),
-                    tuple(int(rows[index + offset]["completed_reps"]) for offset in range(3)),
-                    int(rows[index + 2]["rir"]),
+                    int(group[0]["exercise_id"]),
+                    tuple(int(row["completed_reps"]) for row in group),
+                    int(group[-1]["rir"]),
                 )
-                for index in range(0, len(rows), 3)
-                if index + 2 < len(rows)
+                for group in grouped.values()
+                if group and group[-1]["rir"] is not None
             )
             if actual == expected:
                 return int(candidate["id"])
@@ -906,7 +911,7 @@ class GymService:
         connection: sqlite3.Connection,
         workout_id: int,
         user: str,
-        results: tuple[tuple[sqlite3.Row, tuple[int, int, int], int], ...],
+        results: tuple[tuple[sqlite3.Row, tuple[int, ...], int], ...],
         *,
         duplicate: bool,
     ) -> dict[str, Any]:

@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS workout_exercises (
 );
 CREATE TABLE IF NOT EXISTS sets (
  id INTEGER PRIMARY KEY, workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
- set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 3),
+ set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 20),
  target_reps INTEGER NOT NULL DEFAULT 5,
  completed_reps INTEGER NOT NULL CHECK(completed_reps >= 0),
  weight REAL NOT NULL CHECK(weight >= 0),
@@ -115,6 +115,7 @@ class Database:
         """Create the parent directory and current schema."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_workouts()
+        self._migrate_legacy_sets()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             columns = {
@@ -207,6 +208,44 @@ class Database:
                 )
             connection.execute("DROP TABLE workout_sessions_legacy")
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _migrate_legacy_sets(self) -> None:
+        """Restart-safely expand the historical three-set ceiling."""
+        connection = sqlite3.connect(self.path)
+        try:
+            existing_table = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='sets'"
+            ).fetchone()
+            if existing_table is None or "BETWEEN 1 AND 20" in existing_table[0]:
+                return
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            connection.executescript(
+                """BEGIN IMMEDIATE;
+                ALTER TABLE sets RENAME TO sets_legacy;
+                CREATE TABLE sets (
+                 id INTEGER PRIMARY KEY,
+                 workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
+                 set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 20),
+                 target_reps INTEGER NOT NULL DEFAULT 5,
+                 completed_reps INTEGER NOT NULL CHECK(completed_reps >= 0),
+                 weight REAL NOT NULL CHECK(weight >= 0),
+                 unit TEXT NOT NULL, rir INTEGER CHECK(rir >= 0),
+                 technical_failure INTEGER NOT NULL DEFAULT 0,
+                 notes TEXT NOT NULL DEFAULT '', UNIQUE(workout_exercise_id,set_number));
+                INSERT INTO sets(
+                 id,workout_exercise_id,set_number,target_reps,completed_reps,weight,unit,rir,
+                 technical_failure,notes)
+                SELECT id,workout_exercise_id,set_number,target_reps,completed_reps,weight,unit,rir,
+                 technical_failure,notes FROM sets_legacy;
+                DROP TABLE sets_legacy;
+                COMMIT;"""
+            )
         except Exception:
             connection.rollback()
             raise
