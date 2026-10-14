@@ -19,7 +19,7 @@ INSERT OR IGNORE INTO users(id,slug,display_name) VALUES(2,'freedom','Freedom');
 CREATE TABLE IF NOT EXISTS workout_sessions (
  id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
  local_date TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
- orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
+ orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical','mixed')),
  status TEXT NOT NULL CHECK(status IN ('planned','active','partial','completed','skipped')),
  notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id)
 );
@@ -162,8 +162,12 @@ class Database:
             )
             user_column = next((column for column in columns if column[1] == "user_id"), None)
             supports_partial = existing_table is not None and "'partial'" in existing_table[0]
+            supports_mixed = existing_table is not None and "'mixed'" in existing_table[0]
             if existing_table is None or (
-                user_column is not None and user_column[3] == 1 and supports_partial
+                user_column is not None
+                and user_column[3] == 1
+                and supports_partial
+                and supports_mixed
             ):
                 return
             connection.execute("PRAGMA foreign_keys = OFF")
@@ -181,7 +185,8 @@ class Database:
                  id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, completed_at TEXT,
                  local_date TEXT NOT NULL,
                  source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
-                 orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
+                 orientation TEXT NOT NULL CHECK(
+                  orientation IN ('horizontal','vertical','mixed')),
                  status TEXT NOT NULL CHECK(
                   status IN ('planned','active','partial','completed','skipped')),
                  notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id));"""

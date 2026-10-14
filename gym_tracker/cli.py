@@ -91,6 +91,37 @@ def workout_skip() -> None:
     _run(_service().skip_workout)
 
 
+@workout_app.command("log-bodyweight")
+def workout_log_bodyweight(
+    user: Annotated[str, typer.Option("--user")],
+    activity_date: Annotated[str, typer.Option("--date")],
+    exercise: Annotated[list[str], typer.Option("--exercise")],
+    reps: Annotated[list[str], typer.Option("--reps")],
+    final_set_rir: Annotated[list[int], typer.Option("--final-set-rir")],
+    notes: Annotated[str, typer.Option("--notes")] = "",
+) -> None:
+    """Log one completed backdated bodyweight workout atomically."""
+    if not exercise or len(exercise) != len(reps) or len(exercise) != len(final_set_rir):
+        _run(
+            lambda: (_ for _ in ()).throw(
+                GymError("provide one --reps and --final-set-rir for every --exercise")
+            )
+        )
+        return
+    parsed_reps: list[tuple[int, int, int]] = []
+    try:
+        for value in reps:
+            parsed = tuple(int(item.strip()) for item in value.split(","))
+            if len(parsed) != 3:
+                raise GymError("reps must contain exactly three sets per exercise")
+            parsed_reps.append((parsed[0], parsed[1], parsed[2]))
+    except ValueError as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("reps must be comma-separated integers")))
+        raise AssertionError from error
+    results = tuple(zip(exercise, parsed_reps, final_set_rir, strict=True))
+    _run(_service().log_bodyweight_workout, user, activity_date, results, notes=notes)
+
+
 @log_app.command("exercise")
 def log_exercise(
     exercise: Annotated[str, typer.Option("--exercise")],

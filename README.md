@@ -27,6 +27,20 @@ commit credential material.
 
 Use `gym history summary --user <slug> --json` for total workout history. It counts
 strength workouts from recorded sets and reports raw session lifecycle rows separately.
+Use repeated result options to atomically record a completed, backdated bodyweight session—even
+when its exercises span both orientations and a scheduled workout is active:
+
+```bash
+gym workout log-bodyweight --user geoff --date 2026-10-13 \
+  --exercise "Push-Up" --reps 6,6,6 --final-set-rir 3 \
+  --exercise "Bodyweight Squat" --reps 10,10,10 --final-set-rir 3 \
+  --notes "Low grit bodyweight workout"
+```
+
+Every exercise must already exist with equipment type `bodyweight`. Exact retries return the
+existing workout with `duplicate: true` instead of writing a second session. Mixed sessions do not
+alter horizontal/vertical workout alternation.
+
 Use `gym history correct-date --user <slug> --workout-number <n> --date YYYY-MM-DD` to repair
 a legacy performance date through the governed CLI. Strength logging requires final-set RIR from
 0 through 3 (`3+` is recorded as 3), and partially performed workouts close as `partial` rather

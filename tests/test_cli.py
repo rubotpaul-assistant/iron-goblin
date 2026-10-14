@@ -266,6 +266,102 @@ def test_cli_corrects_performed_workout_date(
     assert json.loads(result.stdout)["exercises_updated"] == 1
 
 
+def test_cli_logs_backdated_mixed_bodyweight_workout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    for command in (
+        [
+            "exercise",
+            "add",
+            "Push-Up",
+            "--category",
+            "push",
+            "--orientation",
+            "horizontal",
+            "--equipment-type",
+            "bodyweight",
+        ],
+        [
+            "exercise",
+            "add",
+            "Bodyweight Squat",
+            "--category",
+            "legs",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "bodyweight",
+        ],
+    ):
+        assert runner.invoke(app, command).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "workout",
+            "log-bodyweight",
+            "--user",
+            "geoff",
+            "--date",
+            "2026-10-13",
+            "--exercise",
+            "Push-Up",
+            "--reps",
+            "6,6,6",
+            "--final-set-rir",
+            "3",
+            "--exercise",
+            "Bodyweight Squat",
+            "--reps",
+            "10,10,10",
+            "--final-set-rir",
+            "3",
+            "--notes",
+            "Low grit bodyweight workout",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["date"] == "2026-10-13"
+    assert payload["orientation"] == "mixed"
+    assert [item["exercise"] for item in payload["exercises"]] == [
+        "Push-Up",
+        "Bodyweight Squat",
+    ]
+
+
+def test_cli_rejects_unpaired_bodyweight_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "workout",
+            "log-bodyweight",
+            "--user",
+            "geoff",
+            "--date",
+            "2026-10-13",
+            "--exercise",
+            "Push-Up",
+            "--exercise",
+            "Bodyweight Squat",
+            "--reps",
+            "6,6,6",
+            "--final-set-rir",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "one --reps and --final-set-rir" in json.loads(result.stdout)["error"]
+
+
 def test_cli_multiuser_cardio_energy_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
