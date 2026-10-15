@@ -138,6 +138,91 @@ def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         assert json.loads(result.stdout)["ok"] is True
 
 
+def test_cli_adds_irregular_loads_and_assigns_existing_exercise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    exercise = runner.invoke(
+        app,
+        [
+            "exercise",
+            "add",
+            "assisted dip",
+            "--category",
+            "push",
+            "--orientation",
+            "vertical",
+            "--equipment-type",
+            "machine",
+        ],
+    )
+    equipment = runner.invoke(
+        app,
+        [
+            "equipment",
+            "add",
+            "assisted dip stack",
+            "--type",
+            "machine",
+            "--min",
+            "30",
+            "--max",
+            "70",
+            "--increment",
+            "5",
+            "--loads",
+            "30,45,55,70",
+            "--direction",
+            "decrease",
+        ],
+    )
+    assigned = runner.invoke(
+        app,
+        [
+            "equipment",
+            "assign",
+            "--exercise",
+            "assisted dip",
+            "--equipment",
+            "assisted dip stack",
+        ],
+    )
+
+    assert exercise.exit_code == equipment.exit_code == assigned.exit_code == 0
+    listed = runner.invoke(app, ["equipment", "list"])
+    assert json.loads(listed.stdout)["equipment"][0]["supported_weights"] == [30, 45, 55, 70]
+    assert json.loads(listed.stdout)["equipment"][0]["progression_direction"] == "decrease"
+
+
+def test_cli_rejects_non_numeric_equipment_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "equipment",
+            "add",
+            "broken stack",
+            "--type",
+            "machine",
+            "--min",
+            "10",
+            "--max",
+            "100",
+            "--increment",
+            "5",
+            "--loads",
+            "10,nope,20",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "loads must be comma-separated numbers"
+
+
 @pytest.mark.parametrize("reps", ["5,wat,5", "5,5"])
 def test_cli_rejects_invalid_reps(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reps: str

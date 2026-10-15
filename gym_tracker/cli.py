@@ -212,8 +212,17 @@ def equipment_add(
     maximum: Annotated[str, typer.Option("--max")],
     increment: Annotated[str, typer.Option("--increment")],
     unit: Annotated[str, typer.Option("--unit")] = "lb",
+    loads: Annotated[str | None, typer.Option("--loads")] = None,
+    direction: Annotated[str, typer.Option("--direction")] = "increase",
 ) -> None:
     """Add equipment and its valid load grid."""
+    try:
+        supported_weights = (
+            () if loads is None else tuple(Decimal(value.strip()) for value in loads.split(","))
+        )
+    except InvalidOperation as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("loads must be comma-separated numbers")))
+        raise AssertionError from error
     _run(
         _service().add_equipment,
         name,
@@ -222,7 +231,18 @@ def equipment_add(
         Decimal(maximum),
         Decimal(increment),
         unit,
+        supported_weights,
+        direction,
     )
+
+
+@equipment_app.command("assign")
+def equipment_assign(
+    exercise: Annotated[str, typer.Option("--exercise")],
+    equipment: Annotated[str, typer.Option("--equipment")],
+) -> None:
+    """Attach equipment to an existing exercise."""
+    _run(_service().assign_equipment, exercise, equipment)
 
 
 @equipment_app.command("list")
