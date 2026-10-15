@@ -27,6 +27,29 @@ commit credential material.
 
 Use `gym history summary --user <slug> --json` for total workout history. It counts
 strength workouts from recorded sets and reports raw session lifecycle rows separately.
+Use repeated result options to atomically record a completed, backdated bodyweight session—even
+when its exercises span both orientations and a scheduled workout is active:
+
+```bash
+gym workout log-bodyweight --user geoff --date 2026-10-13 \
+  --exercise "Push-Up" --reps 6,6,6 --final-set-rir 3 \
+  --exercise "Bodyweight Squat" --reps 10,10,10 --final-set-rir 3 \
+  --notes "Low grit bodyweight workout"
+```
+
+Every exercise must already exist with equipment type `bodyweight`. Exact retries return the
+existing workout with `duplicate: true` instead of writing a second session. Mixed sessions do not
+alter horizontal/vertical workout alternation. Each comma-separated `--reps` value may contain
+between one and twenty sets; final-set RIR is attached to its last set.
+
+Use `gym history correct-date --user <slug> --workout-number <n> --date YYYY-MM-DD` to repair
+a legacy performance date through the governed CLI. Strength logging requires final-set RIR from
+0 through 3 (`3+` is recorded as 3), and partially performed workouts close as `partial` rather
+than `skipped`.
+
+`Strength History` is a projection of performed exercises only. It includes performed-workout
+numbers, lifecycle status, Pacific performance dates, and each set's actual load. Sync retires the
+deprecated `Workout History` tab while preserving unrelated spreadsheet tabs.
 
 ## Multi-user cardio
 
@@ -47,13 +70,17 @@ over MET estimates and are counted once.
 
 Database initialization performs the restart-safe legacy migration: it seeds Geoff and Freedom,
 backfills every legacy strength session to Geoff, preserves child rows, and installs non-null
-ownership and user/date indexes. Back up a production database before running a new build against
-it and retain that backup after verification.
+ownership and user/date indexes. It also adds exercise performance dates, normalizes all-lowercase
+canonical exercise names to Title Case, and distinguishes partial from wholly skipped workouts.
+Back up a production database before running a new build against it and retain that backup after
+verification.
 
 ## Scheduling
 
 Configure OpenClaw to run `gym workout scheduled-begin` at `0 12 * * 1,4` with timezone
 `America/Los_Angeles`. Delivery is a separate conversational action based on the returned JSON.
+When an older workout is still active, scheduled begin carries it forward and returns
+`carried_forward: true` instead of failing or creating a second workout.
 
 The core loop is **RECOMMEND → PERFORM → LOG → ADJUST → REPEAT**.
 

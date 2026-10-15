@@ -91,14 +91,45 @@ def workout_skip() -> None:
     _run(_service().skip_workout)
 
 
+@workout_app.command("log-bodyweight")
+def workout_log_bodyweight(
+    user: Annotated[str, typer.Option("--user")],
+    activity_date: Annotated[str, typer.Option("--date")],
+    exercise: Annotated[list[str], typer.Option("--exercise")],
+    reps: Annotated[list[str], typer.Option("--reps")],
+    final_set_rir: Annotated[list[int], typer.Option("--final-set-rir")],
+    notes: Annotated[str, typer.Option("--notes")] = "",
+) -> None:
+    """Log one completed backdated bodyweight workout atomically."""
+    if not exercise or len(exercise) != len(reps) or len(exercise) != len(final_set_rir):
+        _run(
+            lambda: (_ for _ in ()).throw(
+                GymError("provide one --reps and --final-set-rir for every --exercise")
+            )
+        )
+        return
+    parsed_reps: list[tuple[int, ...]] = []
+    try:
+        for value in reps:
+            parsed = tuple(int(item.strip()) for item in value.split(","))
+            if not parsed or len(parsed) > 20:
+                raise GymError("reps must contain between 1 and 20 sets per exercise")
+            parsed_reps.append(parsed)
+    except ValueError as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("reps must be comma-separated integers")))
+        raise AssertionError from error
+    results = tuple(zip(exercise, parsed_reps, final_set_rir, strict=True))
+    _run(_service().log_bodyweight_workout, user, activity_date, results, notes=notes)
+
+
 @log_app.command("exercise")
 def log_exercise(
     exercise: Annotated[str, typer.Option("--exercise")],
     reps: Annotated[str, typer.Option("--reps")],
+    final_set_rir: Annotated[int, typer.Option("--final-set-rir")],
     weight: Annotated[str | None, typer.Option("--weight")] = None,
     weights: Annotated[str | None, typer.Option("--weights")] = None,
     unit: Annotated[str, typer.Option("--unit")] = "lb",
-    final_set_rir: Annotated[int | None, typer.Option("--final-set-rir")] = None,
     technical_failure: Annotated[bool, typer.Option("--technical-failure")] = False,
 ) -> None:
     """Log one three-set exercise result."""
@@ -136,6 +167,16 @@ def log_exercise(
         final_set_rir,
         technical_failure,
     )
+
+
+@history_app.command("correct-date")
+def history_correct_date(
+    user: Annotated[str, typer.Option("--user")],
+    workout_number: Annotated[int, typer.Option("--workout-number")],
+    activity_date: Annotated[str, typer.Option("--date")],
+) -> None:
+    """Correct the local performance date for one recorded workout."""
+    _run(_service().correct_workout_date, user, workout_number, activity_date)
 
 
 @exercise_app.command("add")
