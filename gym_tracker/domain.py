@@ -35,13 +35,26 @@ class EquipmentRange:
     minimum: Decimal
     maximum: Decimal
     increment: Decimal
+    supported_weights: tuple[Decimal, ...] = ()
+    progression_direction: str = "increase"
 
-    def next_weight(self, current: Decimal) -> Decimal:
-        """Advance one supported increment without exceeding the maximum."""
-        return min(self.maximum, current + self.increment)
+    def next_weight(self, current: Decimal, steps: int = 1) -> Decimal:
+        """Advance across one or more supported loads without exceeding the maximum."""
+        if self.supported_weights:
+            candidates = (
+                [weight for weight in reversed(self.supported_weights) if weight < current]
+                if self.progression_direction == "decrease"
+                else [weight for weight in self.supported_weights if weight > current]
+            )
+            return candidates[min(steps, len(candidates)) - 1] if candidates else current
+        if self.progression_direction == "decrease":
+            return max(self.minimum, current - self.increment * steps)
+        return min(self.maximum, current + self.increment * steps)
 
     def contains(self, weight: Decimal) -> bool:
         """Check whether a weight is aligned to this equipment's stack."""
+        if self.supported_weights:
+            return weight in self.supported_weights
         if weight < self.minimum or weight > self.maximum or self.increment <= 0:
             return False
         return (weight - self.minimum) % self.increment == 0
@@ -68,6 +81,8 @@ def progression_weight(
     """Calculate the next supported working weight and reason code."""
     if performance.unsafe or performance.technical_failure or performance.total_reps < 15:
         return current, "progression_repeat"
+    if performance.reps == (5, 5, 5) and (performance.final_rir or 0) >= 3:
+        return equipment.next_weight(current, 2), "progression_aggressive_increase"
     if performance.reps == (5, 5, 5) and (performance.final_rir or 0) >= 1:
         return equipment.next_weight(current), "progression_increase"
     return current, "progression_repeat"

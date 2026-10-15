@@ -82,16 +82,47 @@ class GymService:
         maximum: Decimal,
         increment: Decimal,
         unit: str = "lb",
+        supported_weights: tuple[Decimal, ...] = (),
+        progression_direction: str = "increase",
     ) -> dict[str, Any]:
         """Create or restore a piece of available equipment."""
-        equipment_range = EquipmentRange(minimum, maximum, increment)
+        normalized_loads = tuple(sorted(set(supported_weights)))
+        if progression_direction not in {"increase", "decrease"}:
+            raise GymError("progression direction must be increase or decrease")
+        if any(weight < minimum or weight > maximum for weight in normalized_loads):
+            raise GymError("supported equipment loads must be within the weight range")
+        equipment_range = EquipmentRange(
+            minimum, maximum, increment, normalized_loads, progression_direction
+        )
         if maximum < minimum or not equipment_range.contains(minimum):
             raise GymError("invalid equipment weight range")
         with self.database.connect() as connection:
             connection.execute(
-                """INSERT INTO equipment(name,equipment_type,min_weight,max_weight,increment,unit)
-                VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET available=1""",
-                (name, equipment_type, float(minimum), float(maximum), float(increment), unit),
+                """INSERT INTO equipment(
+                name,equipment_type,min_weight,max_weight,increment,unit,progression_direction)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET
+                equipment_type=excluded.equipment_type,min_weight=excluded.min_weight,
+                max_weight=excluded.max_weight,increment=excluded.increment,unit=excluded.unit,
+                progression_direction=excluded.progression_direction,available=1""",
+                (
+                    name,
+                    equipment_type,
+                    float(minimum),
+                    float(maximum),
+                    float(increment),
+                    unit,
+                    progression_direction,
+                ),
+            )
+            equipment_id = int(
+                connection.execute(
+                    "SELECT id FROM equipment WHERE name=? COLLATE NOCASE", (name,)
+                ).fetchone()["id"]
+            )
+            connection.execute("DELETE FROM equipment_loads WHERE equipment_id=?", (equipment_id,))
+            connection.executemany(
+                "INSERT INTO equipment_loads(equipment_id,weight) VALUES(?,?)",
+                ((equipment_id, float(weight)) for weight in normalized_loads),
             )
         return {"ok": True, "equipment": name, "available": True}
 
@@ -361,10 +392,39 @@ class GymService:
         """List equipment without exposing configuration or credentials."""
         with self.database.connect() as connection:
             rows = connection.execute(
-                """SELECT name,equipment_type,min_weight,max_weight,increment,unit,available
+                """SELECT name,equipment_type,min_weight,max_weight,increment,unit,
+                progression_direction,available
                 FROM equipment ORDER BY name"""
             ).fetchall()
-        return {"ok": True, "equipment": [dict(row) for row in rows]}
+            loads = connection.execute(
+                """SELECT q.name,l.weight FROM equipment_loads l
+                JOIN equipment q ON q.id=l.equipment_id ORDER BY q.name,l.weight"""
+            ).fetchall()
+        by_name: dict[str, list[float]] = {}
+        for load in loads:
+            by_name.setdefault(str(load["name"]), []).append(float(load["weight"]))
+        equipment = []
+        for row in rows:
+            payload = dict(row)
+            payload["supported_weights"] = by_name.get(str(row["name"]), [])
+            equipment.append(payload)
+        return {"ok": True, "equipment": equipment}
+
+    def assign_equipment(self, exercise: str, equipment: str) -> dict[str, Any]:
+        """Attach a known equipment load grid to an existing exercise."""
+        exercise_id = self._exercise_id(exercise)
+        with self.database.connect() as connection:
+            equipment_row = connection.execute(
+                "SELECT id,name FROM equipment WHERE name=? COLLATE NOCASE", (equipment,)
+            ).fetchone()
+            if equipment_row is None:
+                raise GymError(f"unknown equipment: {equipment}")
+            connection.execute(
+                """INSERT INTO exercise_equipment(exercise_id,equipment_id)
+                VALUES(?,?) ON CONFLICT(exercise_id,equipment_id) DO UPDATE SET required=1""",
+                (exercise_id, equipment_row["id"]),
+            )
+        return {"ok": True, "exercise": exercise, "equipment": equipment_row["name"]}
 
     def remove_equipment(self, name: str) -> dict[str, Any]:
         """Mark equipment unavailable without losing history."""
@@ -1071,7 +1131,7 @@ class GymService:
         recommendations = connection.execute(
             """SELECT e.id AS exercise_id,e.category,e.canonical_name AS exercise,
             wx.prescribed_weight AS weight,
-            wx.unit,3 AS sets,5 AS reps FROM workout_exercises wx
+            wx.unit,3 AS sets FROM workout_exercises wx
             JOIN exercises e ON e.id=wx.exercise_id
             WHERE wx.workout_session_id=? ORDER BY wx.sequence""",
             (workout_id,),
@@ -1093,6 +1153,7 @@ class GymService:
                     "weight": weight,
                     "weight_status": "baseline_required" if weight is None else "known",
                     "previous_set_weights": previous_set_weights,
+                    "reps": self._recommended_reps(connection, workout_id, int(row["exercise_id"])),
                 }
             )
         return {
@@ -1106,6 +1167,28 @@ class GymService:
             "remaining_categories": self._remaining(connection, workout_id),
             "recommendations": recommendation_payloads,
         }
+
+    @staticmethod
+    def _recommended_reps(connection: sqlite3.Connection, workout_id: int, exercise_id: int) -> int:
+        rows = connection.execute(
+            """SELECT s.completed_reps,s.rir,s.technical_failure,e.equipment_type
+            FROM sets s JOIN workout_exercises wx ON wx.id=s.workout_exercise_id
+            JOIN workout_sessions previous ON previous.id=wx.workout_session_id
+            JOIN workout_sessions current ON current.id=?
+            JOIN exercises e ON e.id=wx.exercise_id
+            WHERE wx.exercise_id=? AND previous.user_id=current.user_id
+            AND previous.id<>current.id ORDER BY previous.started_at DESC,previous.id DESC,
+            s.set_number DESC LIMIT 1""",
+            (workout_id, exercise_id),
+        ).fetchall()
+        if not rows or rows[0]["equipment_type"] != "bodyweight":
+            return 5
+        last = rows[0]
+        reps = int(last["completed_reps"])
+        if last["technical_failure"] or last["rir"] is None:
+            return reps
+        rir = int(last["rir"])
+        return reps + 2 if rir >= 3 else reps + 1 if rir >= 1 else reps
 
     @staticmethod
     def _workout_number(connection: sqlite3.Connection, workout_id: int) -> int:
@@ -1164,14 +1247,20 @@ class GymService:
         connection: sqlite3.Connection, exercise_id: int
     ) -> EquipmentRange | None:
         row = connection.execute(
-            """SELECT q.min_weight,q.max_weight,q.increment FROM exercise_equipment ee
+            """SELECT q.id,q.min_weight,q.max_weight,q.increment,q.progression_direction
+            FROM exercise_equipment ee
             JOIN equipment q ON q.id=ee.equipment_id WHERE ee.exercise_id=? AND ee.required=1""",
             (exercise_id,),
         ).fetchone()
         if row is None:
             return None
+        loads = connection.execute(
+            "SELECT weight FROM equipment_loads WHERE equipment_id=? ORDER BY weight", (row["id"],)
+        ).fetchall()
         return EquipmentRange(
             Decimal(str(row["min_weight"])),
             Decimal(str(row["max_weight"])),
             Decimal(str(row["increment"])),
+            tuple(Decimal(str(load["weight"])) for load in loads),
+            str(row["progression_direction"]),
         )

@@ -31,7 +31,14 @@ CREATE TABLE IF NOT EXISTS equipment (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
  equipment_type TEXT NOT NULL, min_weight REAL NOT NULL, max_weight REAL NOT NULL,
  increment REAL NOT NULL CHECK(increment > 0), unit TEXT NOT NULL,
+ progression_direction TEXT NOT NULL DEFAULT 'increase'
+ CHECK(progression_direction IN ('increase','decrease')),
  available INTEGER NOT NULL DEFAULT 1 CHECK(available IN (0,1)), notes TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS equipment_loads (
+ equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
+ weight REAL NOT NULL CHECK(weight >= 0),
+ PRIMARY KEY(equipment_id,weight)
 );
 CREATE TABLE IF NOT EXISTS exercises (
  id INTEGER PRIMARY KEY, canonical_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -122,6 +129,14 @@ class Database:
                 str(column["name"])
                 for column in connection.execute("PRAGMA table_info(workout_exercises)")
             }
+            equipment_columns = {
+                str(column["name"]) for column in connection.execute("PRAGMA table_info(equipment)")
+            }
+            if "progression_direction" not in equipment_columns:
+                connection.execute(
+                    """ALTER TABLE equipment ADD COLUMN progression_direction TEXT NOT NULL
+                    DEFAULT 'increase' CHECK(progression_direction IN ('increase','decrease'))"""
+                )
             if "performed_local_date" not in columns:
                 connection.execute(
                     "ALTER TABLE workout_exercises ADD COLUMN performed_local_date TEXT"

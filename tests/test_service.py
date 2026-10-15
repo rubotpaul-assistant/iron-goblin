@@ -375,6 +375,73 @@ def test_logging_respects_increment_and_progression(service: GymService) -> None
     assert result["sync_pending"] is True
 
 
+def test_bodyweight_recommendation_progresses_completed_reps(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+    for category in Category:
+        service.add_exercise(f"vertical {category}", category, Orientation.VERTICAL, "bodyweight")
+        service.add_exercise(
+            f"horizontal {category}", category, Orientation.HORIZONTAL, "bodyweight"
+        )
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(0), (7, 7, 7), final_rir=3)
+    service.complete_workout()
+    service.begin_workout()
+    for category in Category:
+        service.log_exercise(f"horizontal {category}", Decimal(0), (5, 5, 5), final_rir=0)
+    service.complete_workout()
+
+    recommendations = service.begin_workout()["recommendations"]
+
+    assert {item["reps"] for item in recommendations} == {9}
+
+
+def test_equipment_can_store_irregular_loads_and_attach_existing_exercise(
+    tmp_path: Path,
+) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+    service.add_exercise("Assisted Dip", Category.PUSH, Orientation.VERTICAL, "machine")
+    service.add_equipment(
+        "assisted dip stack",
+        "machine",
+        Decimal(30),
+        Decimal(70),
+        Decimal(5),
+        supported_weights=(Decimal(30), Decimal(45), Decimal(55), Decimal(70)),
+    )
+    service.assign_equipment("Assisted Dip", "assisted dip stack")
+
+    listed = service.list_equipment()["equipment"][0]
+    assert listed["supported_weights"] == [30, 45, 55, 70]
+
+
+def test_equipment_rejects_unknown_progression_direction(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+    with pytest.raises(GymError, match="direction"):
+        service.add_equipment(
+            "bad machine",
+            "machine",
+            Decimal(10),
+            Decimal(100),
+            Decimal(10),
+            progression_direction="sideways",
+        )
+
+
+def test_equipment_rejects_supported_load_outside_declared_range(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "gym.sqlite3"))
+
+    with pytest.raises(GymError, match="within the weight range"):
+        service.add_equipment(
+            "bad stack",
+            "machine",
+            Decimal(10),
+            Decimal(100),
+            Decimal(5),
+            supported_weights=(Decimal(10), Decimal(115)),
+        )
+
+
 def test_logging_preserves_independent_weight_for_each_set(service: GymService) -> None:
     """Warm-up or ramping sets retain their actual loads."""
     service.begin_workout()
