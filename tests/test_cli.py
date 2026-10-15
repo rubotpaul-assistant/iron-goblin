@@ -1,12 +1,15 @@
 """Machine-readable CLI contract tests."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from gym_tracker.cli import app
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def test_cli_returns_json_and_never_environment_secrets(
@@ -204,11 +207,13 @@ def test_cli_requires_final_set_rir(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
 
     result = CliRunner().invoke(
-        app, ["log", "exercise", "--exercise", "press", "--weight", "50", "--reps", "5,5,5"]
+        app,
+        ["log", "exercise", "--exercise", "press", "--weight", "50", "--reps", "5,5,5"],
+        color=True,
     )
 
     assert result.exit_code == 2
-    assert "--final-set-rir" in result.output
+    assert "--final-set-rir" in ANSI_ESCAPE.sub("", result.output)
 
 
 def test_cli_corrects_performed_workout_date(
