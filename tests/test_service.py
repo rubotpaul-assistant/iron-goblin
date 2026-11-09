@@ -209,6 +209,107 @@ def test_history_date_correction_uses_performed_workout_number(service: GymServi
         service.correct_workout_date("geoff", 2, "2026-09-08")
 
 
+def test_history_result_correction_replaces_sets_and_records_audit(service: GymService) -> None:
+    service.begin_workout()
+    service.log_exercise(
+        "vertical push",
+        (Decimal(90), Decimal(90), Decimal(90)),
+        (5, 5, 3),
+        final_rir=0,
+        technical_failure=True,
+    )
+    service.skip_workout()
+
+    corrected = service.correct_workout_result(
+        "geoff",
+        1,
+        "vertical push",
+        (5, 5, 3),
+        (Decimal(90), Decimal(90), Decimal(100)),
+        final_rir=0,
+        technical_failure=True,
+    )
+
+    assert corrected == {
+        "ok": True,
+        "user": "geoff",
+        "workout_number": 1,
+        "exercise": "Vertical Push",
+        "reps": [5, 5, 3],
+        "weights": [90.0, 90.0, 100.0],
+        "unit": "lb",
+        "final_set_rir": 0,
+        "technical_failure": True,
+        "sync_pending": True,
+    }
+    with service.database.connect() as connection:
+        sets = connection.execute(
+            """SELECT completed_reps,weight,rir,technical_failure FROM sets
+            ORDER BY set_number"""
+        ).fetchall()
+        audit = connection.execute(
+            """SELECT before_json,after_json FROM workout_result_corrections"""
+        ).fetchone()
+    assert [tuple(row) for row in sets] == [
+        (5, 90.0, None, 0),
+        (5, 90.0, None, 0),
+        (3, 100.0, 0, 1),
+    ]
+    assert '"weight": 90.0' in audit["before_json"]
+    assert '"weight": 100.0' in audit["after_json"]
+
+
+def test_history_result_correction_validates_target_and_values(service: GymService) -> None:
+    service.begin_workout()
+    service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=1)
+    service.skip_workout()
+
+    with pytest.raises(GymError, match="same number of values"):
+        service.correct_workout_result(
+            "geoff", 1, "vertical push", (5, 5), (Decimal(90),), final_rir=1
+        )
+    with pytest.raises(GymError, match="final-set RIR"):
+        service.correct_workout_result(
+            "geoff",
+            1,
+            "vertical push",
+            (5, 5, 5),
+            (Decimal(90), Decimal(90), Decimal(90)),
+            final_rir=4,
+        )
+    with pytest.raises(GymError, match="not recorded in performed workout 1"):
+        service.correct_workout_result(
+            "geoff",
+            1,
+            "vertical pull",
+            (5, 5, 5),
+            (Decimal(90), Decimal(90), Decimal(90)),
+            final_rir=1,
+        )
+    with pytest.raises(GymError, match="at least 1"):
+        service.correct_workout_result(
+            "geoff", 0, "vertical push", (5,), (Decimal(90),), final_rir=1
+        )
+    with pytest.raises(GymError, match="between 1 and 20"):
+        service.correct_workout_result("geoff", 1, "vertical push", (), (), final_rir=1)
+    with pytest.raises(GymError, match="non-negative"):
+        service.correct_workout_result(
+            "geoff", 1, "vertical push", (-1,), (Decimal(90),), final_rir=1
+        )
+    with pytest.raises(GymError, match="non-negative"):
+        service.correct_workout_result(
+            "geoff", 1, "vertical push", (5,), (Decimal(-1),), final_rir=1
+        )
+    with pytest.raises(GymError, match="unknown performed workout"):
+        service.correct_workout_result(
+            "geoff", 2, "vertical push", (5,), (Decimal(90),), final_rir=1
+        )
+    with pytest.raises(GymError, match="not supported"):
+        service.correct_workout_result(
+            "geoff", 1, "vertical push", (5,), (Decimal(95),), final_rir=1
+        )
+
+
 def test_skip_distinguishes_empty_and_partial_workouts(service: GymService) -> None:
     service.begin_workout()
     assert service.skip_workout()["status"] == "skipped"

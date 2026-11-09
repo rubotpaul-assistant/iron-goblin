@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS sets (
  unit TEXT NOT NULL, rir INTEGER CHECK(rir >= 0), technical_failure INTEGER NOT NULL DEFAULT 0,
  notes TEXT NOT NULL DEFAULT '', UNIQUE(workout_exercise_id,set_number)
 );
+CREATE TABLE IF NOT EXISTS workout_result_corrections (
+ id INTEGER PRIMARY KEY,
+ workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
+ before_json TEXT NOT NULL,
+ after_json TEXT NOT NULL,
+ corrected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS sync_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), pending INTEGER NOT NULL DEFAULT 0,
  last_success_at TEXT, last_error TEXT

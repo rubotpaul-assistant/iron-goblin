@@ -179,6 +179,38 @@ def history_correct_date(
     _run(_service().correct_workout_date, user, workout_number, activity_date)
 
 
+@history_app.command("correct-result")
+def history_correct_result(
+    user: Annotated[str, typer.Option("--user")],
+    workout_number: Annotated[int, typer.Option("--workout-number")],
+    exercise: Annotated[str, typer.Option("--exercise")],
+    reps: Annotated[str, typer.Option("--reps")],
+    weights: Annotated[str, typer.Option("--weights")],
+    final_set_rir: Annotated[int, typer.Option("--final-set-rir")],
+    technical_failure: Annotated[bool, typer.Option("--technical-failure")] = False,
+) -> None:
+    """Correct one recorded exercise result and retain an audit trail."""
+    try:
+        parsed_reps = tuple(int(value.strip()) for value in reps.split(","))
+        parsed_weights = tuple(Decimal(value.strip()) for value in weights.split(","))
+    except ValueError as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("reps must be comma-separated integers")))
+        raise AssertionError from error
+    except InvalidOperation as error:
+        _run(lambda: (_ for _ in ()).throw(GymError("weights must be numeric")))
+        raise AssertionError from error
+    _run(
+        _service().correct_workout_result,
+        user,
+        workout_number,
+        exercise,
+        parsed_reps,
+        parsed_weights,
+        final_set_rir,
+        technical_failure,
+    )
+
+
 @exercise_app.command("add")
 def exercise_add(
     name: str,

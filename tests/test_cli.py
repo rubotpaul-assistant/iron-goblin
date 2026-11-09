@@ -83,6 +83,116 @@ def test_workout_substitute_command_is_exposed(
     assert json.loads(result.stdout)["exercise"] == "Replacement Push"
 
 
+def test_cli_corrects_recorded_workout_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    runner = CliRunner()
+    assert (
+        runner.invoke(
+            app,
+            [
+                "exercise",
+                "add",
+                "Chest Press",
+                "--category",
+                "push",
+                "--orientation",
+                "vertical",
+                "--equipment-type",
+                "machine",
+            ],
+        ).exit_code
+        == 0
+    )
+    assert runner.invoke(app, ["workout", "begin"]).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "log",
+                "exercise",
+                "--exercise",
+                "Chest Press",
+                "--reps",
+                "5,5,3",
+                "--weights",
+                "100,100,100",
+                "--final-set-rir",
+                "0",
+                "--technical-failure",
+            ],
+        ).exit_code
+        == 0
+    )
+    assert runner.invoke(app, ["workout", "skip"]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "history",
+            "correct-result",
+            "--user",
+            "geoff",
+            "--workout-number",
+            "1",
+            "--exercise",
+            "Chest Press",
+            "--reps",
+            "5,5,3",
+            "--weights",
+            "100,100,115",
+            "--final-set-rir",
+            "0",
+            "--technical-failure",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["weights"] == [100.0, 100.0, 115.0]
+    assert payload["technical_failure"] is True
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("--reps", "five,5,3", "comma-separated integers"),
+        ("--weights", "100,heavy,115", "weights must be numeric"),
+    ],
+)
+def test_cli_result_correction_rejects_malformed_sets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    option: str,
+    value: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
+    command = [
+        "history",
+        "correct-result",
+        "--user",
+        "geoff",
+        "--workout-number",
+        "1",
+        "--exercise",
+        "Chest Press",
+        "--reps",
+        "5,5,3",
+        "--weights",
+        "100,100,115",
+        "--final-set-rir",
+        "0",
+    ]
+    command[command.index(option) + 1] = value
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 1
+    assert message in json.loads(result.stdout)["error"]
+
+
 def test_cli_end_to_end_workout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GYM_DATABASE_PATH", str(tmp_path / "gym.sqlite3"))
     runner = CliRunner()

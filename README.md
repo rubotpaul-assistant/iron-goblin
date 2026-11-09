@@ -47,6 +47,15 @@ a legacy performance date through the governed CLI. Strength logging requires fi
 0 through 3 (`3+` is recorded as 3), and partially performed workouts close as `partial` rather
 than `skipped`.
 
+Correct a performed exercise by replacing its complete set result through the governed CLI. The
+command validates the user, performed-workout number, exercise, reps, RIR, and equipment loads;
+it records the before/after values in an append-only audit table and marks Sheets sync pending:
+
+```bash
+gym history correct-result --user geoff --workout-number 20 --exercise "Chest Press" \
+  --reps 5,5,3 --weights 100,100,115 --final-set-rir 0 --technical-failure
+```
+
 `Strength History` is a projection of performed exercises only. It includes performed-workout
 numbers, lifecycle status, Pacific performance dates, and each set's actual load. Sync retires the
 deprecated `Workout History` tab while preserving unrelated spreadsheet tabs.

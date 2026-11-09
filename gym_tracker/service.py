@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date, datetime
 from decimal import Decimal
@@ -884,6 +885,143 @@ class GymService:
             "exercises_updated": result.rowcount,
             "sync_pending": True,
         }
+
+    def correct_workout_result(
+        self,
+        user: str,
+        workout_number: int,
+        exercise: str,
+        reps: tuple[int, ...],
+        weights: tuple[Decimal, ...],
+        final_rir: int,
+        technical_failure: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically replace a performed result while retaining an audit trail."""
+        if workout_number < 1:
+            raise GymError("workout number must be at least 1")
+        if not reps or len(reps) > 20:
+            raise GymError("reps must contain between 1 and 20 sets")
+        if len(reps) != len(weights):
+            raise GymError("reps and weights must contain the same number of values")
+        if any(repetition < 0 for repetition in reps):
+            raise GymError("reps must be non-negative")
+        if any(weight < 0 for weight in weights):
+            raise GymError("weights must be non-negative")
+        if final_rir < 0 or final_rir > 3:
+            raise GymError("final-set RIR must be between 0 and 3")
+        user_id = self._user_id(user)
+        with self.database.connect() as connection:
+            workout_id = self._performed_workout_id(connection, user_id, workout_number)
+            workout_exercise = connection.execute(
+                """SELECT wx.id,wx.exercise_id,wx.unit,e.canonical_name
+                FROM workout_exercises wx JOIN exercises e ON e.id=wx.exercise_id
+                LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
+                WHERE wx.workout_session_id=?
+                AND (e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
+                AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)
+                LIMIT 1""",
+                (workout_id, exercise, exercise),
+            ).fetchone()
+            if workout_exercise is None:
+                raise GymError(
+                    f"exercise is not recorded in performed workout {workout_number}: {exercise}"
+                )
+            equipment = self._equipment_for_exercise(
+                connection, int(workout_exercise["exercise_id"])
+            )
+            if equipment and any(not equipment.contains(weight) for weight in weights):
+                raise GymError("weight is not supported by the required equipment")
+            before = self._result_sets(connection, int(workout_exercise["id"]))
+            after = [
+                {
+                    "set_number": set_number,
+                    "completed_reps": completed_reps,
+                    "weight": float(weight),
+                    "unit": workout_exercise["unit"],
+                    "rir": final_rir if set_number == len(reps) else None,
+                    "technical_failure": technical_failure and set_number == len(reps),
+                }
+                for set_number, (completed_reps, weight) in enumerate(
+                    zip(reps, weights, strict=True), start=1
+                )
+            ]
+            connection.execute(
+                "DELETE FROM sets WHERE workout_exercise_id=?", (workout_exercise["id"],)
+            )
+            connection.executemany(
+                """INSERT INTO sets(workout_exercise_id,set_number,completed_reps,weight,unit,
+                rir,technical_failure) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    (
+                        workout_exercise["id"],
+                        item["set_number"],
+                        item["completed_reps"],
+                        item["weight"],
+                        item["unit"],
+                        item["rir"],
+                        int(item["technical_failure"]),
+                    )
+                    for item in after
+                ),
+            )
+            connection.execute(
+                """INSERT INTO workout_result_corrections(
+                workout_exercise_id,before_json,after_json) VALUES(?,?,?)""",
+                (
+                    workout_exercise["id"],
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(after, sort_keys=True),
+                ),
+            )
+            connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {
+            "ok": True,
+            "user": user,
+            "workout_number": workout_number,
+            "exercise": workout_exercise["canonical_name"],
+            "reps": list(reps),
+            "weights": [float(weight) for weight in weights],
+            "unit": workout_exercise["unit"],
+            "final_set_rir": final_rir,
+            "technical_failure": technical_failure,
+            "sync_pending": True,
+        }
+
+    @staticmethod
+    def _performed_workout_id(
+        connection: sqlite3.Connection, user_id: int, workout_number: int
+    ) -> int:
+        workouts = connection.execute(
+            """SELECT ws.id FROM workout_sessions ws WHERE ws.user_id=? AND EXISTS(
+             SELECT 1 FROM workout_exercises wx JOIN sets s ON s.workout_exercise_id=wx.id
+             WHERE wx.workout_session_id=ws.id)
+            ORDER BY ws.started_at,ws.id""",
+            (user_id,),
+        ).fetchall()
+        if workout_number > len(workouts):
+            raise GymError(f"unknown performed workout number: {workout_number}")
+        return int(workouts[workout_number - 1]["id"])
+
+    @staticmethod
+    def _result_sets(
+        connection: sqlite3.Connection, workout_exercise_id: int
+    ) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """SELECT set_number,completed_reps,weight,unit,rir,technical_failure
+            FROM sets WHERE workout_exercise_id=? ORDER BY set_number""",
+            (workout_exercise_id,),
+        ).fetchall()
+        return [
+            {
+                "set_number": int(row["set_number"]),
+                "completed_reps": int(row["completed_reps"]),
+                "weight": float(row["weight"]),
+                "unit": row["unit"],
+                "rir": row["rir"],
+                "technical_failure": bool(row["technical_failure"]),
+            }
+            for row in rows
+        ]
 
     def _exercise_id(self, name: str) -> int:
         with self.database.connect() as connection:
