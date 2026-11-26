@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS exercise_aliases (
 );
 """
 
+SETS_TABLE = """
+CREATE TABLE IF NOT EXISTS sets (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
+ set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 20),
+ target_reps INTEGER NOT NULL DEFAULT 5,
+ completed_reps INTEGER NOT NULL CHECK(completed_reps >= 0),
+ weight REAL NOT NULL CHECK(weight >= 0),
+ unit TEXT NOT NULL, rir INTEGER CHECK(rir >= 0), technical_failure INTEGER NOT NULL DEFAULT 0,
+ notes TEXT NOT NULL DEFAULT '', UNIQUE(workout_exercise_id,set_number)
+);
+"""
+
 SCHEMA = f"""
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
@@ -85,15 +98,7 @@ CREATE TABLE IF NOT EXISTS workout_exercises (
  result_revision INTEGER NOT NULL DEFAULT 0 CHECK(result_revision>=0),
  UNIQUE(workout_session_id,exercise_id), UNIQUE(workout_session_id,sequence)
 );
-CREATE TABLE IF NOT EXISTS sets (
- id INTEGER PRIMARY KEY, workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
- set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 20),
- target_reps INTEGER NOT NULL DEFAULT 5,
- completed_reps INTEGER NOT NULL CHECK(completed_reps >= 0),
- weight REAL NOT NULL CHECK(weight >= 0),
- unit TEXT NOT NULL, rir INTEGER CHECK(rir >= 0), technical_failure INTEGER NOT NULL DEFAULT 0,
- notes TEXT NOT NULL DEFAULT '', UNIQUE(workout_exercise_id,set_number)
-);
+{SETS_TABLE}
 CREATE TABLE IF NOT EXISTS sync_state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), pending INTEGER NOT NULL DEFAULT 0,
  last_success_at TEXT, last_error TEXT
@@ -328,37 +333,29 @@ class Database:
             connection.close()
 
     def _migrate_legacy_sets(self) -> None:
-        """Restart-safely expand the historical three-set ceiling."""
+        """Expand the historical set limit and keep deleted set IDs from being reused."""
         connection = sqlite3.connect(self.path)
         try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            connection.execute("BEGIN IMMEDIATE")
             existing_table = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='sets'"
             ).fetchone()
-            if existing_table is None or "BETWEEN 1 AND 20" in existing_table[0]:
+            if existing_table is None or "AUTOINCREMENT" in existing_table[0]:
                 return
-            connection.execute("PRAGMA foreign_keys = OFF")
-            connection.execute("PRAGMA legacy_alter_table = ON")
-            connection.executescript(
-                """BEGIN IMMEDIATE;
-                ALTER TABLE sets RENAME TO sets_legacy;
-                CREATE TABLE sets (
-                 id INTEGER PRIMARY KEY,
-                 workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(id),
-                 set_number INTEGER NOT NULL CHECK(set_number BETWEEN 1 AND 20),
-                 target_reps INTEGER NOT NULL DEFAULT 5,
-                 completed_reps INTEGER NOT NULL CHECK(completed_reps >= 0),
-                 weight REAL NOT NULL CHECK(weight >= 0),
-                 unit TEXT NOT NULL, rir INTEGER CHECK(rir >= 0),
-                 technical_failure INTEGER NOT NULL DEFAULT 0,
-                 notes TEXT NOT NULL DEFAULT '', UNIQUE(workout_exercise_id,set_number));
-                INSERT INTO sets(
+            for statement in (
+                "ALTER TABLE sets RENAME TO sets_legacy",
+                SETS_TABLE,
+                """INSERT INTO sets(
                  id,workout_exercise_id,set_number,target_reps,completed_reps,weight,unit,rir,
                  technical_failure,notes)
                 SELECT id,workout_exercise_id,set_number,target_reps,completed_reps,weight,unit,rir,
-                 technical_failure,notes FROM sets_legacy;
-                DROP TABLE sets_legacy;
-                COMMIT;"""
-            )
+                 technical_failure,notes FROM sets_legacy""",
+                "DROP TABLE sets_legacy",
+            ):
+                connection.execute(statement)
+            connection.commit()
         except Exception:
             connection.rollback()
             raise
