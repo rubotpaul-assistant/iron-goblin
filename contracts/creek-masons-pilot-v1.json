@@ -1,0 +1,215 @@
+{
+  "version": 1,
+  "now": "2026-11-26T12:00:00Z",
+  "audiences": {
+    "iron": "https://iron.fixture.invalid/mcp",
+    "macro": "https://macro.fixture.invalid/mcp"
+  },
+  "account": {
+    "account_id": "fixture-account",
+    "time_zone": "America/Los_Angeles"
+  },
+  "base_access": {
+    "issuer": "https://accounts.fixture.invalid",
+    "subject": "fixture-subject",
+    "audience": "https://iron.fixture.invalid/mcp",
+    "client_id": "fixture-client",
+    "connection_id": "fixture-iron-connection",
+    "expires_at": "2026-11-26T12:05:00Z",
+    "scopes": [
+      "workouts:read",
+      "workouts:write"
+    ]
+  },
+  "authorization": [
+    {
+      "name": "iron write",
+      "scope": "workouts:write",
+      "expected_account": "fixture-account"
+    },
+    {
+      "name": "macro same identity",
+      "product": "macro",
+      "scope": "nutrition:read",
+      "access": {
+        "audience": "https://macro.fixture.invalid/mcp",
+        "client_id": "fixture-other-client",
+        "connection_id": "fixture-macro-connection",
+        "scopes": [
+          "nutrition:read"
+        ]
+      },
+      "expected_account": "fixture-account"
+    },
+    {
+      "name": "missing bearer",
+      "access": null,
+      "error": "UNAUTHENTICATED"
+    },
+    {
+      "name": "wrong issuer",
+      "access": {
+        "issuer": "https://other.fixture.invalid"
+      },
+      "error": "UNAUTHENTICATED"
+    },
+    {
+      "name": "wrong audience",
+      "access": {
+        "audience": "https://macro.fixture.invalid/mcp"
+      },
+      "error": "UNAUTHENTICATED"
+    },
+    {
+      "name": "expiry at boundary",
+      "access": {
+        "expires_at": "2026-11-26T12:00:00Z"
+      },
+      "error": "UNAUTHENTICATED"
+    },
+    {
+      "name": "unbound subject",
+      "access": {
+        "subject": "other-subject"
+      },
+      "error": "ACCESS_DENIED"
+    },
+    {
+      "name": "missing invite",
+      "grants": [],
+      "error": "ACCESS_DENIED"
+    },
+    {
+      "name": "macro grant only on iron",
+      "grants": [
+        "macro"
+      ],
+      "error": "ACCESS_DENIED"
+    },
+    {
+      "name": "revoked connection on replay",
+      "revoked_connection": "fixture-iron-connection",
+      "scope": "workouts:write",
+      "error": "ACCESS_DENIED"
+    },
+    {
+      "name": "missing token scope",
+      "access": {
+        "scopes": [
+          "workouts:write"
+        ]
+      },
+      "error": "INSUFFICIENT_SCOPE"
+    },
+    {
+      "name": "missing consent scope",
+      "consent_scopes": [
+        "workouts:write"
+      ],
+      "error": "INSUFFICIENT_SCOPE"
+    },
+    {
+      "name": "wrong client binding",
+      "access": {
+        "client_id": "fixture-other-client"
+      },
+      "error": "ACCESS_DENIED"
+    },
+    {
+      "name": "wrong product connection",
+      "access": {
+        "connection_id": "fixture-macro-connection"
+      },
+      "error": "ACCESS_DENIED"
+    }
+  ],
+  "timed_events": [
+    {
+      "name": "UTC midnight Pacific",
+      "time_zone": "America/Los_Angeles",
+      "occurred_at": "2026-08-17T01:00:00Z",
+      "occurred_at_utc": "2026-08-17T01:00:00Z",
+      "offset_minutes": 0,
+      "local_date": "2026-08-16"
+    },
+    {
+      "name": "same instant London",
+      "time_zone": "Europe/London",
+      "occurred_at": "2026-08-17T01:00:00Z",
+      "occurred_at_utc": "2026-08-17T01:00:00Z",
+      "offset_minutes": 0,
+      "local_date": "2026-08-17"
+    },
+    {
+      "name": "fall back before transition",
+      "time_zone": "America/Los_Angeles",
+      "occurred_at": "2026-11-01T01:30:00-07:00",
+      "occurred_at_utc": "2026-11-01T08:30:00Z",
+      "offset_minutes": -420,
+      "local_date": "2026-11-01"
+    },
+    {
+      "name": "fall back after transition",
+      "time_zone": "America/Los_Angeles",
+      "occurred_at": "2026-11-01T01:30:00-08:00",
+      "occurred_at_utc": "2026-11-01T09:30:00Z",
+      "offset_minutes": -480,
+      "local_date": "2026-11-01"
+    },
+    {
+      "name": "explicit backdate",
+      "time_zone": "America/Los_Angeles",
+      "occurred_at": "2026-08-17T01:00:00Z",
+      "occurred_at_utc": "2026-08-17T01:00:00Z",
+      "offset_minutes": 0,
+      "local_date": "2026-08-10",
+      "historical_date": "2026-08-10"
+    },
+    {
+      "name": "unknown zone",
+      "time_zone": "America/Nowhere",
+      "error": "invalid account time zone"
+    },
+    {
+      "name": "missing offset",
+      "time_zone": "UTC",
+      "occurred_at": "2026-08-17T01:00:00",
+      "error": "event timestamp must include an offset"
+    },
+    {
+      "name": "date-only backdate",
+      "time_zone": "Europe/London",
+      "historical_date": "2026-08-10",
+      "occurred_at_utc": null,
+      "offset_minutes": null,
+      "local_date": "2026-08-10"
+    },
+    {
+      "name": "no event date",
+      "time_zone": "UTC",
+      "error": "event requires a timestamp or historical date"
+    }
+  ],
+  "grants": [
+    "iron",
+    "macro"
+  ],
+  "consents": {
+    "fixture-iron-connection": {
+      "product": "iron",
+      "client_id": "fixture-client",
+      "scopes": [
+        "workouts:read",
+        "workouts:write"
+      ]
+    },
+    "fixture-macro-connection": {
+      "product": "macro",
+      "client_id": "fixture-other-client",
+      "scopes": [
+        "nutrition:read",
+        "nutrition:write"
+      ]
+    }
+  }
+}
