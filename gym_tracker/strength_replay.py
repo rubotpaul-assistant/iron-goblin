@@ -3,13 +3,23 @@
 import hashlib
 import json
 import re
+import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from functools import partial
+from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from gym_tracker.service import PACIFIC, GymError, GymService, ScheduledStrengthResult
+from gym_tracker.service import (
+    PACIFIC,
+    GymError,
+    GymService,
+    PriorStrengthResult,
+    ScheduledStrengthResult,
+)
 
 OPERATION = "record_scheduled_strength_result"
 CLIENT_KEY = re.compile(r"[!-~]{1,128}")
@@ -40,55 +50,112 @@ def record_with_replay(
     The caller must check current authorization before every call. SQLite's
     write lock covers the receipt lookup, result, audit and receipt insert.
     """
+    service.validate_strength_values(result)
+    canonical = (result.workout_id, result.prescription_id, *_exercise_values(result))
+    write = partial(
+        service.record_scheduled_result,
+        owner_id=owner_id,
+        result=result,
+        now=now,
+        time_zone=time_zone,
+    )
+    return _commit_strength_write(
+        service, owner_id, OPERATION, client_key, request_id, canonical, write
+    )
+
+
+def record_prior_workout_with_replay(
+    service: GymService,
+    owner_id: int,
+    performed_date: date,
+    results: tuple[PriorStrengthResult, ...],
+    client_key: str,
+    request_id: UUID,
+    *,
+    time_zone: ZoneInfo,
+    now: datetime | None = None,
+) -> RecordedResponse:
+    """Commit one account-owned historical baseline and replay it by key."""
+    service.validate_prior_strength_results(results)
+    canonical = (performed_date.isoformat(), tuple(_exercise_values(result) for result in results))
+    write = partial(
+        service.record_prior_strength_workout,
+        owner_id=owner_id,
+        performed_date=performed_date,
+        results=results,
+        time_zone=time_zone,
+        now=now,
+    )
+    return _commit_strength_write(
+        service, owner_id, "record_prior_strength_workout", client_key, request_id, canonical, write
+    )
+
+
+def _commit_strength_write(
+    service: GymService,
+    owner_id: int,
+    operation: str,
+    client_key: str,
+    request_id: UUID,
+    canonical: tuple[Any, ...],
+    write: Callable[[sqlite3.Connection], dict[str, Any]],
+) -> RecordedResponse:
     if CLIENT_KEY.fullmatch(client_key) is None:
         raise GymError("idempotency key must contain 1 to 128 visible ASCII characters")
-    service.validate_scheduled_result(result)
-    fingerprint = _fingerprint(result)
+    fingerprint = hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
     with service.database.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         receipt = connection.execute(
             """SELECT fingerprint,response_status,response_body FROM strength_replay_receipts
             WHERE owner_id=? AND operation=? AND client_key=?""",
-            (owner_id, OPERATION, client_key),
+            (owner_id, operation, client_key),
         ).fetchone()
         if receipt is not None:
             if receipt["fingerprint"] != fingerprint:
                 raise IdempotencyKeyReused("idempotency key was already used for different input")
             return RecordedResponse(receipt["response_status"], receipt["response_body"])
 
-        payload = service.record_scheduled_result(
-            connection, owner_id, result, now=now, time_zone=time_zone
-        )
+        payload = write(connection)
         response = RecordedResponse(
             200, json.dumps(payload, separators=(",", ":"), allow_nan=False)
         )
-        connection.execute(
+        prescriptions = (
+            [payload["prescription_id"]]
+            if "prescription_id" in payload
+            else [row["prescription_id"] for row in payload["exercises"]]
+        )
+        connection.executemany(
             """INSERT INTO strength_audit_events(
             actor_id,operation,workout_id,prescription_id,outcome,request_id)
             VALUES(?,?,?,?,'recorded',?)""",
-            (owner_id, OPERATION, result.workout_id, result.prescription_id, str(request_id)),
+            (
+                (owner_id, operation, payload["workout_id"], prescription_id, str(request_id))
+                for prescription_id in prescriptions
+            ),
         )
         connection.execute(
             """INSERT INTO strength_replay_receipts(
             owner_id,operation,client_key,fingerprint,response_status,response_body)
             VALUES(?,?,?,?,?,?)""",
-            (owner_id, OPERATION, client_key, fingerprint, response.status, response.body),
+            (owner_id, operation, client_key, fingerprint, response.status, response.body),
         )
         return response
 
 
-def _fingerprint(result: ScheduledStrengthResult) -> str:
-    canonical = (
-        result.workout_id,
-        result.prescription_id,
-        result.expected_exercise_id,
+def _exercise_values(result: ScheduledStrengthResult | PriorStrengthResult) -> tuple[Any, ...]:
+    exercise_id = (
+        result.expected_exercise_id
+        if isinstance(result, ScheduledStrengthResult)
+        else result.exercise_id
+    )
+    return (
+        exercise_id,
         [_canonical_load(weight) for weight in result.weights],
         result.reps,
         result.unit,
         result.final_rir,
         result.technical_failure,
     )
-    return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
 
 
 def _canonical_load(weight: Decimal) -> tuple[str, int]:
