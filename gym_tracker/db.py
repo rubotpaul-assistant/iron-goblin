@@ -23,10 +23,14 @@ CREATE TABLE IF NOT EXISTS workout_sessions (
  status TEXT NOT NULL CHECK(status IN ('planned','active','partial','completed','skipped')),
  notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_day
- ON workout_sessions(local_date) WHERE source = 'scheduled';
-CREATE UNIQUE INDEX IF NOT EXISTS uq_active_workout
- ON workout_sessions(status) WHERE status = 'active';
+BEGIN IMMEDIATE;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_owner_scheduled_day
+ ON workout_sessions(user_id,local_date) WHERE source = 'scheduled';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_owner_active_workout
+ ON workout_sessions(user_id) WHERE status = 'active';
+DROP INDEX IF EXISTS uq_scheduled_day;
+DROP INDEX IF EXISTS uq_active_workout;
+COMMIT;
 CREATE TABLE IF NOT EXISTS equipment (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
  equipment_type TEXT NOT NULL, min_weight REAL NOT NULL, max_weight REAL NOT NULL,

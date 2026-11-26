@@ -512,13 +512,19 @@ class GymService:
         return {"ok": True, "matches": [dict(row) for row in rows]}
 
     def begin_workout(
-        self, *, scheduled: bool = False, now: datetime | None = None
+        self,
+        *,
+        scheduled: bool = False,
+        now: datetime | None = None,
+        owner_id: int | None = None,
     ) -> dict[str, Any]:
-        """Begin one workout, carrying an active workout across scheduled dates."""
+        """Begin one workout, carrying the owner's active workout across scheduled dates."""
+        owner_id = self._strength_owner(owner_id)
         timestamp = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC)
         local_date = timestamp.date().isoformat()
         with self.database.connect() as connection:
-            existing = self._existing_workout(connection, local_date, scheduled)
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._existing_workout(connection, owner_id, local_date, scheduled)
             if existing is not None:
                 return self._workout_payload(
                     connection,
@@ -532,8 +538,9 @@ class GymService:
                 )
             latest = connection.execute(
                 """SELECT orientation FROM workout_sessions
-                WHERE orientation IN ('horizontal','vertical')
-                ORDER BY started_at DESC,id DESC LIMIT 1"""
+                WHERE user_id=? AND orientation IN ('horizontal','vertical')
+                ORDER BY started_at DESC,id DESC LIMIT 1""",
+                (owner_id,),
             ).fetchone()
             orientation = (
                 Orientation.VERTICAL
@@ -551,13 +558,13 @@ class GymService:
                         "scheduled" if scheduled else "manual",
                         orientation.value,
                         "active",
-                        self._user_id("geoff"),
+                        owner_id,
                     ),
                 )
             except sqlite3.IntegrityError as error:
                 raise GymError("an active workout already exists") from error
             workout_id = int(cursor.lastrowid or 0)
-            self._prescribe(connection, workout_id, orientation)
+            self._prescribe(connection, owner_id, workout_id, orientation)
             return self._workout_payload(connection, workout_id, duplicate=False)
 
     def log_bodyweight_workout(
@@ -642,22 +649,28 @@ class GymService:
                 connection, workout_id, user, normalized, duplicate=False
             )
 
-    def current_workout(self) -> dict[str, Any]:
-        """Return the active workout and remaining categories."""
+    def current_workout(self, *, owner_id: int | None = None) -> dict[str, Any]:
+        """Return the owner's active workout and remaining categories."""
+        owner_id = self._strength_owner(owner_id)
         with self.database.connect() as connection:
+            connection.execute("BEGIN")
             row = connection.execute(
-                "SELECT id FROM workout_sessions WHERE status='active'"
+                "SELECT id FROM workout_sessions WHERE user_id=? AND status='active'",
+                (owner_id,),
             ).fetchone()
             if row is None:
                 raise GymError("no active workout")
             return self._workout_payload(connection, int(row["id"]), duplicate=False)
 
-    def substitute_exercise(self, exercise: str) -> dict[str, Any]:
+    def substitute_exercise(self, exercise: str, *, owner_id: int | None = None) -> dict[str, Any]:
         """Replace an unlogged active prescription with a same-plane/category exercise."""
+        owner_id = self._strength_owner(owner_id)
         exercise_id = self._exercise_id(exercise)
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             workout = connection.execute(
-                "SELECT id,orientation FROM workout_sessions WHERE status='active'"
+                "SELECT id,orientation FROM workout_sessions WHERE user_id=? AND status='active'",
+                (owner_id,),
             ).fetchone()
             if workout is None:
                 raise GymError("no active workout")
@@ -706,13 +719,18 @@ class GymService:
         final_rir: int | None = None,
         technical_failure: bool = False,
         now: datetime | None = None,
+        *,
+        owner_id: int | None = None,
     ) -> dict[str, Any]:
         """Atomically attach a three-set result to the active workout."""
         self._validate_strength_result(reps, final_rir)
         performed_date = self._performed_date(now)
         set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
+        owner_id = self._strength_owner(owner_id)
+        exercise_id = self._exercise_id(exercise)
         with self.database.connect() as connection:
-            workout_exercise = self._active_workout_exercise(connection, exercise)
+            connection.execute("BEGIN IMMEDIATE")
+            workout_exercise = self._active_workout_exercise(connection, owner_id, exercise_id)
             return self._store_strength_result(
                 connection,
                 workout_exercise,
@@ -873,11 +891,14 @@ class GymService:
             "sync_pending": True,
         }
 
-    def complete_workout(self) -> dict[str, Any]:
+    def complete_workout(self, *, owner_id: int | None = None) -> dict[str, Any]:
         """Complete only when push, pull, and legs have recorded results."""
+        owner_id = self._strength_owner(owner_id)
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             workout = connection.execute(
-                "SELECT id FROM workout_sessions WHERE status='active'"
+                "SELECT id FROM workout_sessions WHERE user_id=? AND status='active'",
+                (owner_id,),
             ).fetchone()
             if workout is None:
                 raise GymError("no active workout")
@@ -899,11 +920,14 @@ class GymService:
             "sync_pending": True,
         }
 
-    def skip_workout(self) -> dict[str, Any]:
+    def skip_workout(self, *, owner_id: int | None = None) -> dict[str, Any]:
         """Close the active workout as partial when it contains performed results."""
+        owner_id = self._strength_owner(owner_id)
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             workout = connection.execute(
-                "SELECT id FROM workout_sessions WHERE status='active'"
+                "SELECT id FROM workout_sessions WHERE user_id=? AND status='active'",
+                (owner_id,),
             ).fetchone()
             if workout is None:
                 raise GymError("no active workout")
@@ -1199,12 +1223,17 @@ class GymService:
             str(profile["bmr_sex_parameter"]),
         )
 
+    def _strength_owner(self, owner_id: int | None) -> int:
+        """Resolve the local CLI default. Hosted callers supply an authorized owner."""
+        return self._user_id("geoff") if owner_id is None else owner_id
+
     @staticmethod
     def _existing_workout(
-        connection: sqlite3.Connection, local_date: str, scheduled: bool
+        connection: sqlite3.Connection, owner_id: int, local_date: str, scheduled: bool
     ) -> sqlite3.Row | None:
         active = connection.execute(
-            "SELECT id,local_date,status FROM workout_sessions WHERE status='active'"
+            "SELECT id,local_date,status FROM workout_sessions WHERE user_id=? AND status='active'",
+            (owner_id,),
         ).fetchone()
         if active is not None:
             return cast("sqlite3.Row", active)
@@ -1213,14 +1242,18 @@ class GymService:
                 "sqlite3.Row | None",
                 connection.execute(
                     """SELECT id,local_date,status FROM workout_sessions
-                    WHERE local_date=? AND source='scheduled'""",
-                    (local_date,),
+                    WHERE user_id=? AND local_date=? AND source='scheduled'""",
+                    (owner_id, local_date),
                 ).fetchone(),
             )
         return None
 
     def _prescribe(
-        self, connection: sqlite3.Connection, workout_id: int, orientation: Orientation
+        self,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        workout_id: int,
+        orientation: Orientation,
     ) -> None:
         for sequence, category in enumerate(Category, start=1):
             candidate = connection.execute(
@@ -1230,9 +1263,9 @@ class GymService:
                  WHERE ee.exercise_id=e.id AND ee.required=1 AND q.available=0)
                 ORDER BY COALESCE((SELECT MAX(ws.started_at) FROM workout_exercises wx
                  JOIN workout_sessions ws ON ws.id=wx.workout_session_id
-                 WHERE wx.exercise_id=e.id),'') ASC,
+                 WHERE wx.exercise_id=e.id AND ws.user_id=?),'') ASC,
                  e.canonical_name ASC LIMIT 1""",
-                (category.value, orientation.value),
+                (category.value, orientation.value, owner_id),
             ).fetchone()
             if candidate:
                 prescribed_weight, _ = self._prior_prescription(
@@ -1394,15 +1427,14 @@ class GymService:
         return [category.value for category in Category if category.value not in completed]
 
     def _active_workout_exercise(
-        self, connection: sqlite3.Connection, exercise: str
+        self, connection: sqlite3.Connection, owner_id: int, exercise_id: int
     ) -> sqlite3.Row:
-        exercise_id = self._exercise_id(exercise)
         row = connection.execute(
             """SELECT wx.id,wx.exercise_id,e.canonical_name
             FROM workout_exercises wx JOIN workout_sessions ws
             ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
-            WHERE ws.status='active' AND wx.exercise_id=?""",
-            (exercise_id,),
+            WHERE ws.user_id=? AND ws.status='active' AND wx.exercise_id=?""",
+            (owner_id, exercise_id),
         ).fetchone()
         if row is None:
             raise GymError("exercise is not prescribed in the active workout")

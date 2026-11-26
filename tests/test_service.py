@@ -789,3 +789,87 @@ def test_performed_history_limit_is_applied_to_workouts_before_sets(
     assert len(recent["sets"]) == 3
     with pytest.raises(GymError, match="limit must be between"):
         service.performed_history(1, limit=0)
+
+
+def test_workout_lifecycle_is_isolated_across_owners(service: GymService) -> None:
+    now = datetime(2026, 11, 26, 12, tzinfo=UTC)
+    geoff = service.begin_workout(scheduled=True, now=now)
+    second = service.begin_workout(scheduled=True, now=now, owner_id=2)
+    assert geoff["workout_id"] != second["workout_id"]
+    assert service.current_workout()["workout_id"] == geoff["workout_id"]
+    assert service.current_workout(owner_id=2)["workout_id"] == second["workout_id"]
+
+    service.add_exercise("other press", Category.PUSH, Orientation.VERTICAL, "machine")
+    service.substitute_exercise("other press", owner_id=2)
+    with pytest.raises(GymError, match="not prescribed"):
+        service.log_exercise("other press", Decimal(90), (5, 5, 5), final_rir=1)
+    for category in Category:
+        service.log_exercise(f"vertical {category}", Decimal(90), (5, 5, 5), final_rir=1)
+    assert service.complete_workout()["workout_id"] == geoff["workout_id"]
+    assert service.performed_history(2) == []
+    assert service.current_workout(owner_id=2)["workout_id"] == second["workout_id"]
+    with pytest.raises(GymError, match="no active workout"):
+        service.current_workout()
+
+    service.log_exercise("other press", Decimal(80), (5, 5, 5), final_rir=1, owner_id=2)
+    assert service.skip_workout(owner_id=2)["status"] == "partial"
+    assert service.performed_history(2)[0]["workout_id"] == second["workout_id"]
+    assert service.performed_history(1)[0]["workout_id"] == geoff["workout_id"]
+    assert service.begin_workout(scheduled=True, now=now)["workout_id"] == geoff["workout_id"]
+    assert (
+        service.begin_workout(scheduled=True, now=now, owner_id=2)["workout_id"]
+        == (second["workout_id"])
+    )
+
+
+def test_other_owners_do_not_affect_orientation_or_exercise_rotation(
+    service: GymService,
+) -> None:
+    service.add_exercise("zz alternate press", Category.PUSH, Orientation.VERTICAL, "machine")
+    day_one = datetime(2026, 11, 26, 12, tzinfo=UTC)
+    day_two = datetime(2026, 11, 27, 12, tzinfo=UTC)
+    first = service.begin_workout(scheduled=True, now=day_one)
+    assert first["orientation"] == "vertical"
+    service.log_exercise("vertical push", Decimal(90), (5, 5, 5), final_rir=1)
+    service.skip_workout()
+    assert service.begin_workout(scheduled=True, now=day_two)["orientation"] == "horizontal"
+
+    other = service.begin_workout(scheduled=True, now=day_one, owner_id=2)
+    assert other["orientation"] == "vertical"
+    push = next(row for row in other["recommendations"] if row["category"] == "push")
+    assert push["exercise"] == "Vertical Push"
+    assert push["weight"] is None
+    carried = service.begin_workout(scheduled=True, now=day_two, owner_id=2)
+    assert carried["workout_id"] == other["workout_id"]
+    assert carried["carried_forward"] is True
+
+
+def test_owner_index_migration_preserves_existing_active_and_scheduled_rows(
+    service: GymService,
+) -> None:
+    now = datetime(2026, 11, 26, 12, tzinfo=UTC)
+    original = service.begin_workout(scheduled=True, now=now)
+    with service.database.connect() as connection:
+        connection.executescript(
+            """DROP INDEX uq_owner_scheduled_day;
+            DROP INDEX uq_owner_active_workout;
+            CREATE UNIQUE INDEX uq_scheduled_day ON workout_sessions(local_date)
+                WHERE source='scheduled';
+            CREATE UNIQUE INDEX uq_active_workout ON workout_sessions(status)
+                WHERE status='active';"""
+        )
+
+    reopened = GymService(Database(service.database.path))
+    assert reopened.current_workout() == original
+    assert (
+        reopened.begin_workout(scheduled=True, now=now, owner_id=2)["workout_id"]
+        != (original["workout_id"])
+    )
+    reopened.database.initialize()
+    assert reopened.current_workout()["workout_id"] == original["workout_id"]
+    with reopened.database.connect() as connection:
+        indexes = {
+            index["name"] for index in connection.execute("PRAGMA index_list(workout_sessions)")
+        }
+        assert {"uq_owner_scheduled_day", "uq_owner_active_workout"} <= indexes
+        assert not ({"uq_scheduled_day", "uq_active_workout"} & indexes)

@@ -22,11 +22,7 @@ AFTER_MIDNIGHT = datetime(2026, 11, 27, 8, 1, tzinfo=UTC)
 
 
 def scheduled_result(service: GymService, owner_id: int, now: datetime) -> ScheduledStrengthResult:
-    workout_id = service.begin_workout(scheduled=True, now=now)["workout_id"]
-    with service.database.connect() as connection:
-        connection.execute(
-            "UPDATE workout_sessions SET user_id=? WHERE id=?", (owner_id, workout_id)
-        )
+    workout_id = service.begin_workout(scheduled=True, now=now, owner_id=owner_id)["workout_id"]
     active = service.active_scheduled_workout(owner_id)
     assert active is not None
     prescription = active["prescriptions"][0]
