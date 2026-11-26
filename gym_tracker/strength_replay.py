@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
-from gym_tracker.service import GymError, GymService, ScheduledStrengthResult
+from gym_tracker.service import PACIFIC, GymError, GymService, ScheduledStrengthResult
 
 OPERATION = "record_scheduled_strength_result"
 CLIENT_KEY = re.compile(r"[!-~]{1,128}")
@@ -32,6 +33,7 @@ def record_with_replay(
     request_id: UUID,
     *,
     now: datetime | None = None,
+    time_zone: ZoneInfo = PACIFIC,
 ) -> RecordedResponse:
     """Record one authorized result or return its original response.
 
@@ -54,7 +56,9 @@ def record_with_replay(
                 raise IdempotencyKeyReused("idempotency key was already used for different input")
             return RecordedResponse(receipt["response_status"], receipt["response_body"])
 
-        payload = service.record_scheduled_result(connection, owner_id, result, now=now)
+        payload = service.record_scheduled_result(
+            connection, owner_id, result, now=now, time_zone=time_zone
+        )
         response = RecordedResponse(
             200, json.dumps(payload, separators=(",", ":"), allow_nan=False)
         )

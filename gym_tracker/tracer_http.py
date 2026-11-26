@@ -3,9 +3,11 @@
 import json
 import re
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import parse_qs
 from uuid import uuid4
 from wsgiref.types import StartResponse, WSGIEnvironment
 
@@ -42,6 +44,10 @@ class InvalidRequest(Exception):
     """Malformed input with a fixed public error response."""
 
 
+class InvalidHistoryRange(Exception):
+    """The supplied local-date filter is invalid."""
+
+
 class TracerHTTP:
     """Serve the three private operations using an explicitly supplied tracer."""
 
@@ -76,10 +82,21 @@ class TracerHTTP:
                     _read_result(environ, route.workout_id),
                     environ.get("HTTP_IDEMPOTENCY_KEY", ""),
                     uuid4(),
+                    now=self._tracer.now(),
+                    time_zone=self._tracer.time_zone,
                 )
             if path == f"{WORKOUTS_PATH}/active":
                 return _json_response(200, {"workout": service.active_scheduled_workout(owner_id)})
-            return _json_response(200, {"workouts": service.performed_history(owner_id)})
+            today = self._tracer.now().astimezone(self._tracer.time_zone).date()
+            start, end = _history_dates(environ.get("QUERY_STRING", ""), today)
+            return _json_response(
+                200,
+                {
+                    "workouts": service.performed_history(
+                        owner_id, from_date=start, through_date=end
+                    )
+                },
+            )
         except TracerAccessDenied as error:
             if str(error) == "INSUFFICIENT_SCOPE":
                 return _error(403, "INSUFFICIENT_SCOPE")
@@ -90,6 +107,8 @@ class TracerHTTP:
             return _error(409, "IDEMPOTENCY_KEY_REUSED")
         except WorkoutStateConflict:
             return _error(409, "WORKOUT_STATE_CONFLICT")
+        except InvalidHistoryRange:
+            return _error(422, "INVALID_HISTORY_RANGE")
         except (GymError, InvalidRequest):
             return _error(422, "INVALID_RESULT")
 
@@ -109,6 +128,31 @@ def _bearer(environ: WSGIEnvironment) -> str | None:
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None
+
+
+def _history_dates(query: str, today: date) -> tuple[date | None, date | None]:
+    try:
+        if len(query) > 128:
+            raise InvalidHistoryRange
+        params = parse_qs(query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+        if params == {"day": ["today"]}:
+            return today, today
+        if params.keys() - {"from_date", "through_date"}:
+            raise InvalidHistoryRange
+        dates: dict[str, date] = {}
+        for key, values in params.items():
+            if len(values) != 1:
+                raise InvalidHistoryRange
+            parsed = date.fromisoformat(values[0])
+            if parsed.isoformat() != values[0]:
+                raise InvalidHistoryRange
+            dates[key] = parsed
+    except ValueError:
+        raise InvalidHistoryRange from None
+    start, end = dates.get("from_date"), dates.get("through_date")
+    if start is not None and end is not None and start > end:
+        raise InvalidHistoryRange
+    return start, end
 
 
 def _read_result(environ: WSGIEnvironment, workout_id: int) -> ScheduledStrengthResult:

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlencode
 
 from gym_tracker.strength_replay import RecordedResponse
 from gym_tracker.tracer_http import MAX_SQLITE_INTEGER, WORKOUTS_PATH
@@ -13,10 +14,7 @@ PROTOCOL_VERSION = "2025-11-25"
 ACTIVE_TOOL = "iron_goblin_get_active_workout"
 RECORD_TOOL = "iron_goblin_record_exercise_result"
 HISTORY_TOOL = "iron_goblin_get_performed_history"
-READ_PATHS = {
-    ACTIVE_TOOL: f"{WORKOUTS_PATH}/active",
-    HISTORY_TOOL: f"{WORKOUTS_PATH}/history",
-}
+HISTORY_FILTERS = {"day", "from_date", "through_date"}
 
 
 @dataclass(frozen=True)
@@ -92,8 +90,13 @@ class TracerMCP:
             request = TracerRequest(
                 "POST", f"{WORKOUTS_PATH}/{workout_id}/exercise-results", authorization, body, key
             )
-        elif name in READ_PATHS and not arguments:
-            request = TracerRequest("GET", READ_PATHS[name], authorization)
+        elif name == ACTIVE_TOOL and not arguments:
+            request = TracerRequest("GET", f"{WORKOUTS_PATH}/active", authorization)
+        elif name == HISTORY_TOOL and not (arguments.keys() - HISTORY_FILTERS):
+            if any(not isinstance(value, str) for value in arguments.values()):
+                return None
+            query = f"?{urlencode(arguments)}" if arguments else ""
+            request = TracerRequest("GET", f"{WORKOUTS_PATH}/history{query}", authorization)
         else:
             return None
 
@@ -110,6 +113,10 @@ def _make_tools(openapi: dict[str, Any]) -> list[dict[str, Any]]:
     schemas = openapi["components"]["schemas"]
     post = openapi["paths"][f"{WORKOUTS_PATH}/{{workoutId}}/exercise-results"]["post"]
     parameters = {parameter["name"]: parameter["schema"] for parameter in post["parameters"]}
+    history = openapi["paths"][f"{WORKOUTS_PATH}/history"]["get"]
+    history_filters = {
+        parameter["name"]: deepcopy(parameter["schema"]) for parameter in history["parameters"]
+    }
     write_schema = deepcopy(schemas["ResultInput"])
     write_schema["$defs"] = {"SetInput": deepcopy(schemas["SetInput"])}
     write_schema["properties"]["sets"]["items"] = {"$ref": "#/$defs/SetInput"}
@@ -135,8 +142,12 @@ def _make_tools(openapi: dict[str, Any]) -> list[dict[str, Any]]:
         },
         {
             "name": HISTORY_TOOL,
-            "description": "Get recent performed workouts and recorded sets.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+            "description": "Get performed workouts for today, a local-date range, or recent days.",
+            "inputSchema": {
+                "type": "object",
+                "properties": history_filters,
+                "additionalProperties": False,
+            },
             "annotations": {"readOnlyHint": True},
         },
     ]

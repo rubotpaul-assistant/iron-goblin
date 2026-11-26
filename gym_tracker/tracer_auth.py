@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from gym_tracker.db import Database
-from gym_tracker.service import GymService
+from gym_tracker.service import PACIFIC, GymService
 
 
 class WorkoutScope(StrEnum):
@@ -39,6 +40,7 @@ class TracerBinding:
     subject: str
     audience: str
     owner_id: int
+    time_zone: ZoneInfo = PACIFIC
 
 
 class TracerAccessDenied(Exception):
@@ -63,6 +65,14 @@ class PrivateTracer:
         self._verify_grant = verify_grant
         self._clock = clock
 
+    @property
+    def time_zone(self) -> ZoneInfo:
+        """Return the validated account time zone for the fixture binding."""
+        return self._binding.time_zone
+
+    def now(self) -> datetime:
+        return self._clock()
+
     def authorize(self, token: str | None, scope: WorkoutScope) -> int:
         """Authorize each request before looking up domain records or replay receipts."""
         grant = self._verify_grant(token) if token else None
@@ -74,7 +84,7 @@ class PrivateTracer:
             or grant.subject != binding.subject
             or grant.audience != binding.audience
             or grant.expires_at.utcoffset() is None
-            or grant.expires_at <= self._clock()
+            or grant.expires_at <= self.now()
         ):
             raise TracerAccessDenied("UNAUTHENTICATED")
         if scope not in grant.scopes:
