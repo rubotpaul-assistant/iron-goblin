@@ -19,6 +19,7 @@ from gym_tracker.service import (
     GymService,
     PriorStrengthResult,
     ScheduledStrengthResult,
+    StrengthDateCorrection,
 )
 
 OPERATION = "record_scheduled_strength_result"
@@ -91,6 +92,42 @@ def record_prior_workout_with_replay(
     )
 
 
+def correct_exercise_date_with_replay(
+    service: GymService,
+    owner_id: int,
+    correction: StrengthDateCorrection,
+    client_key: str,
+    request_id: UUID,
+    *,
+    time_zone: ZoneInfo,
+    now: datetime | None = None,
+) -> RecordedResponse:
+    """Change a specific result once and replay its original correction response."""
+    canonical = (
+        correction.workout_id,
+        correction.prescription_id,
+        correction.expected_revision,
+        correction.local_date.isoformat(),
+    )
+    write = partial(
+        service.correct_performed_exercise_date,
+        owner_id=owner_id,
+        correction=correction,
+        time_zone=time_zone,
+        now=now,
+    )
+    return _commit_strength_write(
+        service,
+        owner_id,
+        "correct_exercise_date",
+        client_key,
+        request_id,
+        canonical,
+        write,
+        audit_outcome="corrected",
+    )
+
+
 def _commit_strength_write(
     service: GymService,
     owner_id: int,
@@ -99,6 +136,8 @@ def _commit_strength_write(
     request_id: UUID,
     canonical: tuple[Any, ...],
     write: Callable[[sqlite3.Connection], dict[str, Any]],
+    *,
+    audit_outcome: str = "recorded",
 ) -> RecordedResponse:
     if CLIENT_KEY.fullmatch(client_key) is None:
         raise GymError("idempotency key must contain 1 to 128 visible ASCII characters")
@@ -127,9 +166,16 @@ def _commit_strength_write(
         connection.executemany(
             """INSERT INTO strength_audit_events(
             actor_id,operation,workout_id,prescription_id,outcome,request_id)
-            VALUES(?,?,?,?,'recorded',?)""",
+            VALUES(?,?,?,?,?,?)""",
             (
-                (owner_id, operation, payload["workout_id"], prescription_id, str(request_id))
+                (
+                    owner_id,
+                    operation,
+                    payload["workout_id"],
+                    prescription_id,
+                    audit_outcome,
+                    str(request_id),
+                )
                 for prescription_id in prescriptions
             ),
         )

@@ -100,6 +100,14 @@ class PriorStrengthResult:
     technical_failure: bool = False
 
 
+@dataclass(frozen=True)
+class StrengthDateCorrection:
+    workout_id: int
+    prescription_id: int
+    expected_revision: int
+    local_date: date
+
+
 class GymService:
     """Own workout selection, mutation, history, and progression."""
 
@@ -1001,7 +1009,7 @@ class GymService:
         connection.execute(
             """UPDATE workout_exercises
             SET status='completed',performed_local_date=?,performed_at_utc=?,performed_time_zone=?,
-            performed_date_explicit=? WHERE id=?""",
+            performed_date_explicit=?,result_revision=result_revision+1 WHERE id=?""",
             (
                 performed.local_date.isoformat(),
                 performed.occurred_at_utc.isoformat() if performed.occurred_at_utc else None,
@@ -1109,7 +1117,7 @@ class GymService:
             rows = connection.execute(
                 """WITH owned_exercises AS (
                     SELECT ws.id AS workout_id,ws.status,ws.started_at,wx.id AS prescription_id,
-                    wx.exercise_id,wx.sequence,
+                    wx.exercise_id,wx.sequence,wx.result_revision,
                     COALESCE(wx.performed_local_date,ws.local_date) AS effective_date
                     FROM workout_sessions ws JOIN workout_exercises wx
                     ON wx.workout_session_id=ws.id WHERE ws.user_id=?
@@ -1123,7 +1131,8 @@ class GymService:
                     ORDER BY started_at DESC,workout_id DESC LIMIT ?
                 )
                 SELECT p.workout_id,p.status,p.local_date,wx.prescription_id,
-                wx.exercise_id,wx.effective_date AS performed_local_date,s.id AS set_id,
+                wx.exercise_id,wx.result_revision,wx.effective_date AS performed_local_date,
+                s.id AS set_id,
                 s.set_number,s.completed_reps,s.weight,s.unit,s.rir,s.technical_failure
                 FROM performed p JOIN matching_exercises wx ON wx.workout_id=p.workout_id
                 JOIN sets s ON s.workout_exercise_id=wx.prescription_id
@@ -1212,8 +1221,9 @@ class GymService:
                 raise GymError(f"unknown performed workout number: {workout_number}")
             workout_id = int(workouts[workout_number - 1]["id"])
             result = connection.execute(
-                """UPDATE workout_exercises SET performed_local_date=?,performed_date_explicit=1
-                WHERE workout_session_id=? AND status='completed' AND EXISTS(
+                """UPDATE workout_exercises SET performed_local_date=?,performed_date_explicit=1,
+                result_revision=result_revision+1 WHERE workout_session_id=?
+                AND status='completed' AND EXISTS(
                  SELECT 1 FROM sets WHERE sets.workout_exercise_id=workout_exercises.id)""",
                 (corrected_date, workout_id),
             )
@@ -1225,6 +1235,45 @@ class GymService:
             "date": corrected_date,
             "exercises_updated": result.rowcount,
             "sync_pending": True,
+        }
+
+    def correct_performed_exercise_date(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        correction: StrengthDateCorrection,
+        *,
+        time_zone: ZoneInfo,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Change one owned result's effective date while keeping the original occurrence."""
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """SELECT wx.result_revision FROM workout_exercises wx JOIN workout_sessions ws
+            ON ws.id=wx.workout_session_id WHERE ws.user_id=? AND ws.id=? AND wx.id=?
+            AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)""",
+            (owner_id, correction.workout_id, correction.prescription_id),
+        ).fetchone()
+        if row is None:
+            raise WorkoutRecordNotFound("workout or prescription not found")
+        if row["result_revision"] != correction.expected_revision:
+            raise WorkoutStateConflict("workout result has changed")
+        if correction.local_date > self._strength_event(now, time_zone).local_date:
+            raise GymError("a performance date cannot be in the future")
+        local_date = correction.local_date.isoformat()
+        connection.execute(
+            """UPDATE workout_exercises SET performed_local_date=?,performed_date_explicit=1,
+            result_revision=result_revision+1 WHERE id=?""",
+            (local_date, correction.prescription_id),
+        )
+        connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {
+            "ok": True,
+            "workout_id": correction.workout_id,
+            "prescription_id": correction.prescription_id,
+            "performed_local_date": local_date,
+            "result_revision": correction.expected_revision + 1,
         }
 
     @staticmethod

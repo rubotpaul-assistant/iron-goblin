@@ -721,6 +721,10 @@
               0,
               1
             ]
+          },
+          "result_revision": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": [
@@ -733,7 +737,8 @@
           "weight",
           "unit",
           "rir",
-          "technical_failure"
+          "technical_failure",
+          "result_revision"
         ],
         "additionalProperties": false
       },
