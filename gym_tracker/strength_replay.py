@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
@@ -19,6 +19,7 @@ from gym_tracker.service import (
     GymError,
     GymService,
     PerformedExercise,
+    PerformedWorkout,
     PriorStrengthResult,
     ScheduledStrengthResult,
     StrengthDateCorrection,
@@ -136,8 +137,14 @@ class DeletionPreview:
     confirmation: str = field(repr=False)
 
 
-class ExerciseDeletion:
-    """Prepare and confirm a short-lived, owner-bound result deletion."""
+@dataclass(frozen=True)
+class WorkoutDeletionPreview:
+    target: PerformedWorkout
+    confirmation: str = field(repr=False)
+
+
+class StrengthDeletion:
+    """Prepare and confirm short-lived, owner-bound strength deletions."""
 
     def __init__(self, key: bytes) -> None:
         if len(key) < 32:
@@ -193,14 +200,64 @@ class ExerciseDeletion:
             audit_outcome="deleted",
         )
 
-    def _signature(self, owner_id: int, target: PerformedExercise, expires_at: int) -> str:
-        payload = (
-            f"delete_exercise:{owner_id}:{target.workout_id}:{target.prescription_id}:"
-            f"{target.result_revision}:{expires_at}"
+    def prepare_workout(
+        self,
+        service: GymService,
+        owner_id: int,
+        workout_id: int,
+        *,
+        now: datetime,
+    ) -> WorkoutDeletionPreview:
+        target = service.preview_workout_deletion(owner_id, workout_id)
+        expires_at = int(now.timestamp()) + 600
+        return WorkoutDeletionPreview(
+            target, f"{expires_at}.{self._signature(owner_id, target, expires_at)}"
         )
+
+    def confirm_workout(
+        self,
+        service: GymService,
+        owner_id: int,
+        preview: WorkoutDeletionPreview,
+        client_key: str,
+        request_id: UUID,
+        *,
+        now: datetime,
+    ) -> RecordedResponse:
+        """Remove the complete workout only if its confirmed result revisions still match."""
+        canonical = (asdict(preview.target), preview.confirmation)
+
+        def delete(connection: sqlite3.Connection) -> dict[str, Any]:
+            self._verify(owner_id, preview, now)
+            return service.delete_performed_workout(connection, owner_id, preview.target)
+
+        return _commit_strength_write(
+            service,
+            owner_id,
+            "delete_performed_workout",
+            client_key,
+            request_id,
+            canonical,
+            delete,
+            audit_outcome="deleted",
+        )
+
+    def _signature(
+        self, owner_id: int, target: PerformedExercise | PerformedWorkout, expires_at: int
+    ) -> str:
+        if isinstance(target, PerformedExercise):
+            payload = (
+                f"delete_exercise:{owner_id}:{target.workout_id}:{target.prescription_id}:"
+                f"{target.result_revision}:{expires_at}"
+            )
+        else:
+            encoded = json.dumps(asdict(target), separators=(",", ":"))
+            payload = f"delete_workout:{owner_id}:{encoded}:{expires_at}"
         return hmac.new(self._key, payload.encode(), hashlib.sha256).hexdigest()
 
-    def _verify(self, owner_id: int, preview: DeletionPreview, now: datetime) -> None:
+    def _verify(
+        self, owner_id: int, preview: DeletionPreview | WorkoutDeletionPreview, now: datetime
+    ) -> None:
         expiry, _, supplied = preview.confirmation.partition(".")
         if not (
             1 <= len(expiry) <= 20
@@ -214,6 +271,9 @@ class ExerciseDeletion:
         signature = self._signature(owner_id, preview.target, expires_at)
         if not hmac.compare_digest(signature, supplied) or now.timestamp() >= expires_at:
             raise GymError("invalid deletion confirmation")
+
+
+ExerciseDeletion = StrengthDeletion
 
 
 def _commit_strength_write(
