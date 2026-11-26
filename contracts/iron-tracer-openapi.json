@@ -1,0 +1,714 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Iron Goblin private fixture tracer",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/v1/iron-goblin/workouts/active": {
+      "get": {
+        "operationId": "getActiveWorkout",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-required-scope": "workouts:read",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "workout": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/ActiveWorkout"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "workout"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "UNAUTHENTICATED"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "INSUFFICIENT_SCOPE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "INSUFFICIENT_SCOPE"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/iron-goblin/workouts/{workoutId}/exercise-results": {
+      "post": {
+        "operationId": "recordExerciseResult",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-required-scope": "workouts:write",
+        "parameters": [
+          {
+            "name": "workoutId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[!-~]{1,128}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResultInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordedResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "UNAUTHENTICATED"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "INSUFFICIENT_SCOPE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "INSUFFICIENT_SCOPE"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "WORKOUT_OR_PRESCRIPTION_NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "WORKOUT_OR_PRESCRIPTION_NOT_FOUND"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "WORKOUT_STATE_CONFLICT or IDEMPOTENCY_KEY_REUSED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "WORKOUT_STATE_CONFLICT",
+                            "IDEMPOTENCY_KEY_REUSED"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "INVALID_RESULT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "INVALID_RESULT"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/iron-goblin/workouts/history": {
+      "get": {
+        "operationId": "getPerformedHistory",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "x-required-scope": "workouts:read",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "workouts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PerformedWorkout"
+                      },
+                      "maxItems": 10
+                    }
+                  },
+                  "required": [
+                    "workouts"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "UNAUTHENTICATED"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "INSUFFICIENT_SCOPE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "INSUFFICIENT_SCOPE"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Prescription": {
+        "type": "object",
+        "properties": {
+          "prescription_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "exercise_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "prescription_id",
+          "exercise_id",
+          "unit",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "ActiveWorkout": {
+        "type": "object",
+        "properties": {
+          "workout_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "status": {
+            "const": "active"
+          },
+          "prescriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Prescription"
+            }
+          }
+        },
+        "required": [
+          "workout_id",
+          "status",
+          "prescriptions"
+        ],
+        "additionalProperties": false
+      },
+      "SetInput": {
+        "type": "object",
+        "properties": {
+          "reps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "load": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          }
+        },
+        "required": [
+          "reps",
+          "load"
+        ],
+        "additionalProperties": false
+      },
+      "ResultInput": {
+        "type": "object",
+        "properties": {
+          "prescription_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "expected_exercise_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "sets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SetInput"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "final_set_rir": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "technical_failure": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "prescription_id",
+          "expected_exercise_id",
+          "sets",
+          "unit",
+          "final_set_rir"
+        ],
+        "additionalProperties": false
+      },
+      "RecordedResult": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "workout_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "prescription_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "performed_local_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "exercise": {
+            "type": "string"
+          },
+          "total_reps": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "set_weights": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "next_weight": {
+            "type": "number"
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "reason_code": {
+            "type": "string"
+          },
+          "sync_pending": {
+            "const": true
+          }
+        },
+        "required": [
+          "ok",
+          "workout_id",
+          "prescription_id",
+          "performed_local_date",
+          "exercise",
+          "total_reps",
+          "set_weights",
+          "next_weight",
+          "unit",
+          "reason_code",
+          "sync_pending"
+        ],
+        "additionalProperties": false
+      },
+      "SetEvidence": {
+        "type": "object",
+        "properties": {
+          "prescription_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "exercise_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "performed_local_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "set_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "set_number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "completed_reps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "weight": {
+            "type": "number"
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "rir": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9223372036854775807
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "technical_failure": {
+            "enum": [
+              0,
+              1
+            ]
+          }
+        },
+        "required": [
+          "prescription_id",
+          "exercise_id",
+          "performed_local_date",
+          "set_id",
+          "set_number",
+          "completed_reps",
+          "weight",
+          "unit",
+          "rir",
+          "technical_failure"
+        ],
+        "additionalProperties": false
+      },
+      "PerformedWorkout": {
+        "type": "object",
+        "properties": {
+          "workout_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "status": {
+            "type": "string"
+          },
+          "local_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "sets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SetEvidence"
+            }
+          }
+        },
+        "required": [
+          "workout_id",
+          "status",
+          "local_date",
+          "sets"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}
