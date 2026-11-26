@@ -108,6 +108,13 @@ class StrengthDateCorrection:
     local_date: date
 
 
+@dataclass(frozen=True)
+class PerformedExercise:
+    workout_id: int
+    prescription_id: int
+    result_revision: int
+
+
 class GymService:
     """Own workout selection, mutation, history, and progression."""
 
@@ -1249,14 +1256,9 @@ class GymService:
         """Change one owned result's effective date while keeping the original occurrence."""
         if not connection.in_transaction:
             connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            """SELECT wx.result_revision FROM workout_exercises wx JOIN workout_sessions ws
-            ON ws.id=wx.workout_session_id WHERE ws.user_id=? AND ws.id=? AND wx.id=?
-            AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)""",
-            (owner_id, correction.workout_id, correction.prescription_id),
-        ).fetchone()
-        if row is None:
-            raise WorkoutRecordNotFound("workout or prescription not found")
+        row = self._owned_performed_exercise(
+            connection, owner_id, correction.workout_id, correction.prescription_id
+        )
         if row["result_revision"] != correction.expected_revision:
             raise WorkoutStateConflict("workout result has changed")
         if correction.local_date > self._strength_event(now, time_zone).local_date:
@@ -1275,6 +1277,74 @@ class GymService:
             "performed_local_date": local_date,
             "result_revision": correction.expected_revision + 1,
         }
+
+    def preview_exercise_deletion(
+        self, owner_id: int, workout_id: int, prescription_id: int
+    ) -> PerformedExercise:
+        """Resolve one performed result for an explicit deletion confirmation."""
+        with self.database.connect() as connection:
+            row = self._owned_performed_exercise(connection, owner_id, workout_id, prescription_id)
+            return PerformedExercise(workout_id, prescription_id, int(row["result_revision"]))
+
+    def delete_performed_exercise(
+        self, connection: sqlite3.Connection, owner_id: int, target: PerformedExercise
+    ) -> dict[str, Any]:
+        """Remove owned sets and prevent old mutation keys from restoring them."""
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        row = self._owned_performed_exercise(
+            connection, owner_id, target.workout_id, target.prescription_id
+        )
+        if row["result_revision"] != target.result_revision:
+            raise WorkoutStateConflict("workout result has changed")
+        connection.execute(
+            "DELETE FROM sets WHERE workout_exercise_id=?", (target.prescription_id,)
+        )
+        status = "prescribed" if row["status"] == "active" else "deleted"
+        connection.execute(
+            """UPDATE workout_exercises SET status=?,performed_local_date=NULL,
+            performed_at_utc=NULL,performed_time_zone=NULL,performed_date_explicit=0,
+            result_revision=result_revision+1 WHERE id=?""",
+            (status, target.prescription_id),
+        )
+        connection.execute(
+            """UPDATE strength_replay_receipts
+            SET response_status=404,response_body=?
+            WHERE owner_id=? AND response_status=200 AND operation<>'delete_performed_exercise'
+            AND json_extract(response_body,'$.workout_id')=?
+            AND (json_extract(response_body,'$.prescription_id')=? OR EXISTS(
+                SELECT 1 FROM json_each(response_body,'$.exercises') AS exercise
+                WHERE json_extract(exercise.value,'$.prescription_id')=?))""",
+            (
+                '{"error":{"code":"WORKOUT_OR_PRESCRIPTION_NOT_FOUND"}}',
+                owner_id,
+                target.workout_id,
+                target.prescription_id,
+                target.prescription_id,
+            ),
+        )
+        connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        return {
+            "ok": True,
+            "workout_id": target.workout_id,
+            "prescription_id": target.prescription_id,
+            "deleted": True,
+        }
+
+    @staticmethod
+    def _owned_performed_exercise(
+        connection: sqlite3.Connection, owner_id: int, workout_id: int, prescription_id: int
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """SELECT wx.result_revision,ws.status FROM workout_exercises wx
+            JOIN workout_sessions ws ON ws.id=wx.workout_session_id
+            WHERE ws.user_id=? AND ws.id=? AND wx.id=?
+            AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)""",
+            (owner_id, workout_id, prescription_id),
+        ).fetchone()
+        if row is None:
+            raise WorkoutRecordNotFound("workout or prescription not found")
+        return cast("sqlite3.Row", row)
 
     @staticmethod
     def _exercise_id(
@@ -1478,7 +1548,7 @@ class GymService:
                  AND (q.owner_id IS NULL OR q.owner_id=e.owner_id))
                 ORDER BY COALESCE((SELECT MAX(ws.started_at) FROM workout_exercises wx
                  JOIN workout_sessions ws ON ws.id=wx.workout_session_id
-                 WHERE wx.exercise_id=e.id AND ws.user_id=?),'') ASC,
+                 WHERE wx.exercise_id=e.id AND ws.user_id=? AND wx.status<>'deleted'),'') ASC,
                  e.owner_id IS NULL,e.canonical_name ASC LIMIT 1""",
                 (owner_id, category.value, orientation.value, owner_id),
             ).fetchone()

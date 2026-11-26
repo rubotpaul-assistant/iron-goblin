@@ -1,11 +1,12 @@
 """Atomic private-tracer writes with owner-scoped replay receipts."""
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
@@ -17,6 +18,7 @@ from gym_tracker.service import (
     PACIFIC,
     GymError,
     GymService,
+    PerformedExercise,
     PriorStrengthResult,
     ScheduledStrengthResult,
     StrengthDateCorrection,
@@ -126,6 +128,92 @@ def correct_exercise_date_with_replay(
         write,
         audit_outcome="corrected",
     )
+
+
+@dataclass(frozen=True)
+class DeletionPreview:
+    target: PerformedExercise
+    confirmation: str = field(repr=False)
+
+
+class ExerciseDeletion:
+    """Prepare and confirm a short-lived, owner-bound result deletion."""
+
+    def __init__(self, key: bytes) -> None:
+        if len(key) < 32:
+            raise ValueError("deletion confirmation key must contain at least 32 bytes")
+        self._key = key
+
+    def prepare(
+        self,
+        service: GymService,
+        owner_id: int,
+        workout_id: int,
+        prescription_id: int,
+        *,
+        now: datetime,
+    ) -> DeletionPreview:
+        target = service.preview_exercise_deletion(owner_id, workout_id, prescription_id)
+        expires_at = int(now.timestamp()) + 600
+        return DeletionPreview(
+            target, f"{expires_at}.{self._signature(owner_id, target, expires_at)}"
+        )
+
+    def confirm(
+        self,
+        service: GymService,
+        owner_id: int,
+        preview: DeletionPreview,
+        client_key: str,
+        request_id: UUID,
+        *,
+        now: datetime,
+    ) -> RecordedResponse:
+        """Check the specific preview before deletion. Retries preserve the successful reply."""
+        target = preview.target
+        canonical = (
+            target.workout_id,
+            target.prescription_id,
+            target.result_revision,
+            preview.confirmation,
+        )
+
+        def delete(connection: sqlite3.Connection) -> dict[str, Any]:
+            self._verify(owner_id, preview, now)
+            return service.delete_performed_exercise(connection, owner_id, target)
+
+        return _commit_strength_write(
+            service,
+            owner_id,
+            "delete_performed_exercise",
+            client_key,
+            request_id,
+            canonical,
+            delete,
+            audit_outcome="deleted",
+        )
+
+    def _signature(self, owner_id: int, target: PerformedExercise, expires_at: int) -> str:
+        payload = (
+            f"delete_exercise:{owner_id}:{target.workout_id}:{target.prescription_id}:"
+            f"{target.result_revision}:{expires_at}"
+        )
+        return hmac.new(self._key, payload.encode(), hashlib.sha256).hexdigest()
+
+    def _verify(self, owner_id: int, preview: DeletionPreview, now: datetime) -> None:
+        expiry, _, supplied = preview.confirmation.partition(".")
+        if not (
+            1 <= len(expiry) <= 20
+            and expiry.isascii()
+            and expiry.isdecimal()
+            and len(supplied) == 64
+            and supplied.isascii()
+        ):
+            raise GymError("invalid deletion confirmation")
+        expires_at = int(expiry)
+        signature = self._signature(owner_id, preview.target, expires_at)
+        if not hmac.compare_digest(signature, supplied) or now.timestamp() >= expires_at:
+            raise GymError("invalid deletion confirmation")
 
 
 def _commit_strength_write(
