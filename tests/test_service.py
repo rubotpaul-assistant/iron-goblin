@@ -1,7 +1,7 @@
 """Application service integration tests against real SQLite."""
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -873,3 +873,35 @@ def test_owner_index_migration_preserves_existing_active_and_scheduled_rows(
         }
         assert {"uq_owner_scheduled_day", "uq_owner_active_workout"} <= indexes
         assert not ({"uq_scheduled_day", "uq_active_workout"} & indexes)
+
+
+def test_history_range_filters_per_exercise_and_preserves_stored_day(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    london = ZoneInfo("Europe/London")
+    midnight_utc = datetime(2026, 11, 27, 0, 10, tzinfo=UTC)
+    active = service.active_scheduled_workout(1)
+    assert active is not None
+    other = active["prescriptions"][1]
+    next_result = replace(
+        scheduled_result,
+        prescription_id=other["prescription_id"],
+        expected_exercise_id=other["exercise_id"],
+    )
+    with service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, scheduled_result, now=midnight_utc)
+        service.record_scheduled_result(
+            connection, 1, next_result, now=midnight_utc, time_zone=london
+        )
+    day = midnight_utc.astimezone(london).date()
+    previous_day = date(2026, 11, 26)
+    yesterday = service.performed_history(1, through_date=previous_day)
+    today = service.performed_history(1, from_date=day)
+    assert {row["prescription_id"] for row in yesterday[0]["sets"]} == {
+        scheduled_result.prescription_id
+    }
+    assert {row["prescription_id"] for row in today[0]["sets"]} == {next_result.prescription_id}
+    assert len(service.performed_history(1)[0]["sets"]) == 6
+    assert service.performed_history(2, from_date=day) == []
+    with pytest.raises(GymError, match="from_date must be on or before"):
+        service.performed_history(1, from_date=day, through_date=previous_day)

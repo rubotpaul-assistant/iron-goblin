@@ -401,8 +401,66 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Invalid local-date filters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "const": "INVALID_HISTORY_RANGE"
+                        }
+                      },
+                      "required": [
+                        "code"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
           }
-        }
+        },
+        "description": "Filter inclusive persisted account-local dates, or use day=today. A filtered workout contains only sets in the selected range.",
+        "parameters": [
+          {
+            "name": "day",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "today"
+              ]
+            },
+            "description": "Resolve today in the current account time zone. Use by itself."
+          },
+          {
+            "name": "from_date",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "through_date",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        ]
       }
     }
   },

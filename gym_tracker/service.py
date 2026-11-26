@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from math import isfinite
 from typing import Any, cast
@@ -641,7 +641,8 @@ class GymService:
                 workout_exercise = connection.execute(
                     """INSERT INTO workout_exercises(
                     workout_session_id,exercise_id,prescribed_weight,unit,sequence,status,
-                    performed_local_date) VALUES(?,?,?,?,?,'completed',?)""",
+                    performed_local_date,performed_time_zone,performed_date_explicit)
+                    VALUES(?,?,?,?,?,'completed',?,?,1)""",
                     (
                         workout_id,
                         exercise["id"],
@@ -649,6 +650,7 @@ class GymService:
                         exercise["default_unit"],
                         sequence,
                         activity_date.isoformat(),
+                        PACIFIC.key,
                     ),
                 )
                 workout_exercise_id = int(workout_exercise.lastrowid or 0)
@@ -748,7 +750,7 @@ class GymService:
     ) -> dict[str, Any]:
         """Atomically attach a three-set result to the active workout."""
         self._validate_strength_result(reps, final_rir)
-        performed_date = self._performed_date(now)
+        performed_at = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC)
         set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
         owner_id = self._strength_owner(owner_id)
         with self.database.connect() as connection:
@@ -760,7 +762,8 @@ class GymService:
                 set_weights,
                 Performance(reps, final_rir, technical_failure),
                 unit,
-                performed_date,
+                performed_at,
+                PACIFIC,
             )
 
     def active_scheduled_workout(self, owner_id: int) -> dict[str, Any] | None:
@@ -788,6 +791,7 @@ class GymService:
         result: ScheduledStrengthResult,
         *,
         now: datetime | None = None,
+        time_zone: ZoneInfo = PACIFIC,
     ) -> dict[str, Any]:
         """Record one owned prescription in the caller's write transaction.
 
@@ -817,19 +821,20 @@ class GymService:
             raise WorkoutStateConflict("workout or prescription has changed")
         if result.unit != prescription["unit"]:
             raise GymError("weight unit must match the prescription")
-        performed_date = self._performed_date(now)
+        performed_at = (now or datetime.now(tz=time_zone)).astimezone(time_zone)
         payload = self._store_strength_result(
             connection,
             prescription,
             result.weights,
             Performance(result.reps, result.final_rir, result.technical_failure),
             result.unit,
-            performed_date,
+            performed_at,
+            time_zone,
         )
         return payload | {
             "workout_id": result.workout_id,
             "prescription_id": result.prescription_id,
-            "performed_local_date": performed_date,
+            "performed_local_date": performed_at.date().isoformat(),
         }
 
     @staticmethod
@@ -853,10 +858,6 @@ class GymService:
         if final_rir < 0 or final_rir > 3:
             raise GymError("final-set RIR must be between 0 and 3")
 
-    @staticmethod
-    def _performed_date(now: datetime | None) -> str:
-        return (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC).date().isoformat()
-
     def _store_strength_result(
         self,
         connection: sqlite3.Connection,
@@ -864,7 +865,8 @@ class GymService:
         set_weights: tuple[Decimal, Decimal, Decimal],
         performance: Performance,
         unit: str,
-        performed_date: str,
+        performed_at: datetime,
+        time_zone: ZoneInfo,
     ) -> dict[str, Any]:
         reps, final_rir, technical_failure = (
             performance.reps,
@@ -895,8 +897,14 @@ class GymService:
             )
         connection.execute(
             """UPDATE workout_exercises
-            SET status='completed',performed_local_date=? WHERE id=?""",
-            (performed_date, workout_exercise["id"]),
+            SET status='completed',performed_local_date=?,performed_at_utc=?,performed_time_zone=?,
+            performed_date_explicit=0 WHERE id=?""",
+            (
+                performed_at.date().isoformat(),
+                performed_at.astimezone(UTC).isoformat(),
+                time_zone.key,
+                workout_exercise["id"],
+            ),
         )
         working_weight = set_weights[-1]
         next_weight, reason = (working_weight, "baseline_recorded")
@@ -978,28 +986,45 @@ class GymService:
             ).fetchall()
         return {"ok": True, "workouts": [dict(row) for row in rows]}
 
-    def performed_history(self, owner_id: int, limit: int = 10) -> list[dict[str, Any]]:
-        """Return the most recent owned workouts with recorded sets and canonical IDs."""
+    def performed_history(
+        self,
+        owner_id: int,
+        limit: int = 10,
+        *,
+        from_date: date | None = None,
+        through_date: date | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent owned workouts and sets in an optional inclusive local-date range."""
         if not 1 <= limit <= 100:
             raise GymError("limit must be between 1 and 100")
+        if from_date is not None and through_date is not None and from_date > through_date:
+            raise GymError("from_date must be on or before through_date")
+        start = from_date.isoformat() if from_date is not None else None
+        end = through_date.isoformat() if through_date is not None else None
         with self.database.connect() as connection:
             rows = connection.execute(
-                """WITH performed AS (
-                    SELECT ws.id,ws.status,ws.started_at,
-                    COALESCE(MIN(wx.performed_local_date),ws.local_date) AS local_date
-                    FROM workout_sessions ws
-                    JOIN workout_exercises wx ON wx.workout_session_id=ws.id
-                    JOIN sets s ON s.workout_exercise_id=wx.id
-                    WHERE ws.user_id=?
-                    GROUP BY ws.id ORDER BY ws.started_at DESC,ws.id DESC LIMIT ?
+                """WITH owned_exercises AS (
+                    SELECT ws.id AS workout_id,ws.status,ws.started_at,wx.id AS prescription_id,
+                    wx.exercise_id,wx.sequence,
+                    COALESCE(wx.performed_local_date,ws.local_date) AS effective_date
+                    FROM workout_sessions ws JOIN workout_exercises wx
+                    ON wx.workout_session_id=ws.id WHERE ws.user_id=?
+                    AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)
+                ), matching_exercises AS (
+                    SELECT * FROM owned_exercises
+                    WHERE (? IS NULL OR effective_date>=?) AND (? IS NULL OR effective_date<=?)
+                ), performed AS (
+                    SELECT workout_id,status,started_at,MIN(effective_date) AS local_date
+                    FROM matching_exercises GROUP BY workout_id
+                    ORDER BY started_at DESC,workout_id DESC LIMIT ?
                 )
-                SELECT p.id AS workout_id,p.status,p.local_date,wx.id AS prescription_id,
-                wx.exercise_id,wx.performed_local_date,s.id AS set_id,s.set_number,
-                s.completed_reps,s.weight,s.unit,s.rir,s.technical_failure
-                FROM performed p JOIN workout_exercises wx ON wx.workout_session_id=p.id
-                JOIN sets s ON s.workout_exercise_id=wx.id
-                ORDER BY p.started_at DESC,p.id DESC,wx.sequence,s.set_number""",
-                (owner_id, limit),
+                SELECT p.workout_id,p.status,p.local_date,wx.prescription_id,
+                wx.exercise_id,wx.effective_date AS performed_local_date,s.id AS set_id,
+                s.set_number,s.completed_reps,s.weight,s.unit,s.rir,s.technical_failure
+                FROM performed p JOIN matching_exercises wx ON wx.workout_id=p.workout_id
+                JOIN sets s ON s.workout_exercise_id=wx.prescription_id
+                ORDER BY p.started_at DESC,p.workout_id DESC,wx.sequence,s.set_number""",
+                (owner_id, start, start, end, end, limit),
             ).fetchall()
         workouts: dict[int, dict[str, Any]] = {}
         for row in rows:
@@ -1083,7 +1108,7 @@ class GymService:
                 raise GymError(f"unknown performed workout number: {workout_number}")
             workout_id = int(workouts[workout_number - 1]["id"])
             result = connection.execute(
-                """UPDATE workout_exercises SET performed_local_date=?
+                """UPDATE workout_exercises SET performed_local_date=?,performed_date_explicit=1
                 WHERE workout_session_id=? AND status='completed' AND EXISTS(
                  SELECT 1 FROM sets WHERE sets.workout_exercise_id=workout_exercises.id)""",
                 (corrected_date, workout_id),

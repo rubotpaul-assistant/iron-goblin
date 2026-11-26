@@ -143,7 +143,13 @@ def test_lost_mcp_response_replays_original_http_body(
     body = retry["structuredContent"]
     assert json.loads(retry["content"][0]["text"]) == body
     assert body["prescription_id"] == write["prescription_id"]
-    history = call(mcp, HISTORY_TOOL, {})
+    history = call(mcp, HISTORY_TOOL, {"day": "today"})
+    assert call(mcp, HISTORY_TOOL, {"from_date": "2000-01-01", "through_date": "2000-01-01"})[
+        "structuredContent"
+    ] == {"workouts": []}
+    assert call(mcp, HISTORY_TOOL, {"day": "tomorrow"})["structuredContent"] == {
+        "error": {"code": "INVALID_HISTORY_RANGE"}
+    }
     (workout,) = history["structuredContent"]["workouts"]
     assert workout["workout_id"] == body["workout_id"]
     assert workout["status"] == "active"
@@ -197,6 +203,7 @@ def test_mcp_uses_transport_authorization_and_rejects_invalid_messages(
         {},
         {"name": ACTIVE_TOOL, "arguments": []},
         {"name": ACTIVE_TOOL, "arguments": {"account_id": 2}},
+        {"name": HISTORY_TOOL, "arguments": {"from_date": 12}},
         {"name": RECORD_TOOL, "arguments": write | {"workout_id": True}},
         {"name": RECORD_TOOL, "arguments": write | {"idempotency_key": None}},
         {"name": "other"},

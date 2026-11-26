@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from wsgiref.util import setup_testing_defaults
 from wsgiref.validate import validator
+from zoneinfo import ZoneInfo
 
 import pytest
 from typer.testing import CliRunner
@@ -46,10 +47,11 @@ def send(
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
     environ: dict[str, Any] = {}
     setup_testing_defaults(environ)
+    path_info, _, query = path.partition("?")
     environ.update(
         REQUEST_METHOD=method,
-        PATH_INFO=path,
-        QUERY_STRING="",
+        PATH_INFO=path_info,
+        QUERY_STRING=query,
         CONTENT_TYPE=content_type,
         CONTENT_LENGTH=str(len(body)),
     )
@@ -288,3 +290,88 @@ def test_openapi_documents_the_same_private_contract() -> None:
         assert contract["paths"][f"{WORKOUTS_PATH}/{suffix}"]["get"]["x-required-scope"] == (
             WorkoutScope.READ
         )
+
+
+@pytest.mark.parametrize(
+    ("zone", "instant", "effective_day"),
+    [
+        ("America/Los_Angeles", "2026-08-17T01:00:00+00:00", "2026-08-16"),
+        ("Europe/London", "2026-08-17T01:00:00+00:00", "2026-08-17"),
+        ("America/Los_Angeles", "2026-11-01T08:30:00+00:00", "2026-11-01"),
+        ("America/Los_Angeles", "2026-11-01T09:30:00+00:00", "2026-11-01"),
+    ],
+)
+def test_history_today_uses_account_zone_and_keeps_exact_instant(
+    tmp_path: Path, zone: str, instant: str, effective_day: str
+) -> None:
+    now = datetime.fromisoformat(instant)
+    binding = replace(BINDING, time_zone=ZoneInfo(zone))
+    grant = replace(GRANT, expires_at=now + timedelta(minutes=1))
+    instance = PrivateTracer(
+        tmp_path / "zone.sqlite3", binding, {FIXTURE_TOKEN: grant}.get, clock=lambda: now
+    )
+    seed(instance.service)
+    instance.service.begin_workout(scheduled=True)
+    api = TracerHTTP(instance)
+    active = json.loads(send(api, "GET", f"{WORKOUTS_PATH}/active")[1])["workout"]
+    today = f"{WORKOUTS_PATH}/history?day=today"
+    assert send(api, "GET", today) == (200, b'{"workouts":[]}')
+    (prescription,) = active["prescriptions"]
+    result = send(
+        api,
+        "POST",
+        f"{WORKOUTS_PATH}/{active['workout_id']}/exercise-results",
+        {
+            "prescription_id": prescription["prescription_id"],
+            "expected_exercise_id": prescription["exercise_id"],
+            "final_set_rir": 1,
+            "unit": prescription["unit"],
+            "sets": [{"reps": 5, "load": "90"}] * 3,
+        },
+        key="local-day",
+    )
+    assert result[0] == 200
+    assert json.loads(result[1])["performed_local_date"] == effective_day
+    (workout,) = json.loads(send(api, "GET", today)[1])["workouts"]
+    assert workout["local_date"] == effective_day
+    assert workout["status"] == "active"
+    assert len(workout["sets"]) == 3
+    with instance.service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT performed_at_utc,performed_time_zone FROM workout_exercises"
+        ).fetchone()
+        assert tuple(row) == (instant, zone)
+
+    instance.service.correct_workout_date("geoff", 1, "2026-07-03")
+    assert send(api, "GET", today) == (200, b'{"workouts":[]}')
+    history_path = f"{WORKOUTS_PATH}/history?from_date=2026-07-01&through_date=2026-07-03"
+    (backdated,) = json.loads(send(api, "GET", history_path)[1])["workouts"]
+    assert backdated["workout_id"] == workout["workout_id"]
+    assert {row["performed_local_date"] for row in backdated["sets"]} == {"2026-07-03"}
+    with instance.service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT performed_at_utc,performed_time_zone,performed_date_explicit "
+            "FROM workout_exercises"
+        ).fetchone()
+        assert tuple(row) == (instant, zone, 1)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "from_date=20261126",
+        "from_date=2026-11-30&through_date=2026-11-26",
+        "day=tomorrow",
+        "day=today&from_date=2026-11-26",
+        "through_date=2026-11-26&through_date=2026-11-27",
+        "day",
+        "day=" + "x" * 128,
+    ],
+)
+def test_history_range_queries_validate_after_authorization(
+    tracer: PrivateTracer, query: str
+) -> None:
+    path = f"{WORKOUTS_PATH}/history?{query}"
+    api = TracerHTTP(tracer)
+    assert send(api, "GET", path, token=None)[0] == 401
+    assert send(api, "GET", path) == (422, b'{"error":{"code":"INVALID_HISTORY_RANGE"}}')

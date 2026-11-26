@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS workout_exercises (
  id INTEGER PRIMARY KEY, workout_session_id INTEGER NOT NULL REFERENCES workout_sessions(id),
  exercise_id INTEGER NOT NULL REFERENCES exercises(id), prescribed_weight REAL,
  unit TEXT NOT NULL, sequence INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'prescribed',
- performed_local_date TEXT,
+ performed_local_date TEXT, performed_at_utc TEXT, performed_time_zone TEXT,
+ performed_date_explicit INTEGER NOT NULL DEFAULT 0 CHECK(performed_date_explicit IN (0,1)),
  UNIQUE(workout_session_id,exercise_id), UNIQUE(workout_session_id,sequence)
 );
 CREATE TABLE IF NOT EXISTS sets (
@@ -171,6 +172,17 @@ class Database:
             if "performed_local_date" not in columns:
                 connection.execute(
                     "ALTER TABLE workout_exercises ADD COLUMN performed_local_date TEXT"
+                )
+            if "performed_at_utc" not in columns:
+                connection.execute("ALTER TABLE workout_exercises ADD COLUMN performed_at_utc TEXT")
+            if "performed_time_zone" not in columns:
+                connection.execute(
+                    "ALTER TABLE workout_exercises ADD COLUMN performed_time_zone TEXT"
+                )
+            if "performed_date_explicit" not in columns:
+                connection.execute(
+                    """ALTER TABLE workout_exercises ADD COLUMN performed_date_explicit
+                    INTEGER NOT NULL DEFAULT 0 CHECK(performed_date_explicit IN (0,1))"""
                 )
             if "status" in columns:
                 connection.execute(
