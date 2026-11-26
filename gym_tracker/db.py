@@ -7,7 +7,38 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA = """
+EQUIPMENT_TABLE = """
+CREATE TABLE IF NOT EXISTS equipment (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE,
+ equipment_type TEXT NOT NULL, min_weight REAL NOT NULL, max_weight REAL NOT NULL,
+ increment REAL NOT NULL CHECK(increment > 0), unit TEXT NOT NULL,
+ progression_direction TEXT NOT NULL DEFAULT 'increase'
+ CHECK(progression_direction IN ('increase','decrease')),
+ available INTEGER NOT NULL DEFAULT 1 CHECK(available IN (0,1)), notes TEXT NOT NULL DEFAULT '',
+ owner_id INTEGER REFERENCES users(id)
+);
+"""
+
+EXERCISES_TABLE = """
+CREATE TABLE IF NOT EXISTS exercises (
+ id INTEGER PRIMARY KEY, canonical_name TEXT NOT NULL COLLATE NOCASE,
+ category TEXT NOT NULL CHECK(category IN ('push','pull','legs')),
+ orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
+ equipment_type TEXT NOT NULL, default_unit TEXT NOT NULL,
+ active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), notes TEXT NOT NULL DEFAULT '',
+ owner_id INTEGER REFERENCES users(id)
+);
+"""
+
+ALIASES_TABLE = """
+CREATE TABLE IF NOT EXISTS exercise_aliases (
+ id INTEGER PRIMARY KEY, alias TEXT NOT NULL COLLATE NOCASE,
+ exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
+ owner_id INTEGER REFERENCES users(id)
+);
+"""
+
+SCHEMA = f"""
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -31,30 +62,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_owner_active_workout
 DROP INDEX IF EXISTS uq_scheduled_day;
 DROP INDEX IF EXISTS uq_active_workout;
 COMMIT;
-CREATE TABLE IF NOT EXISTS equipment (
- id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
- equipment_type TEXT NOT NULL, min_weight REAL NOT NULL, max_weight REAL NOT NULL,
- increment REAL NOT NULL CHECK(increment > 0), unit TEXT NOT NULL,
- progression_direction TEXT NOT NULL DEFAULT 'increase'
- CHECK(progression_direction IN ('increase','decrease')),
- available INTEGER NOT NULL DEFAULT 1 CHECK(available IN (0,1)), notes TEXT NOT NULL DEFAULT ''
-);
+{EQUIPMENT_TABLE}
 CREATE TABLE IF NOT EXISTS equipment_loads (
  equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
  weight REAL NOT NULL CHECK(weight >= 0),
  PRIMARY KEY(equipment_id,weight)
 );
-CREATE TABLE IF NOT EXISTS exercises (
- id INTEGER PRIMARY KEY, canonical_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
- category TEXT NOT NULL CHECK(category IN ('push','pull','legs')),
- orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical')),
- equipment_type TEXT NOT NULL, default_unit TEXT NOT NULL,
- active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), notes TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS exercise_aliases (
- id INTEGER PRIMARY KEY, alias TEXT NOT NULL UNIQUE COLLATE NOCASE,
- exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE
-);
+{EXERCISES_TABLE}
+{ALIASES_TABLE}
 CREATE TABLE IF NOT EXISTS exercise_equipment (
  exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
  equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
@@ -178,6 +193,55 @@ class Database:
                         "UPDATE exercises SET canonical_name=? WHERE id=?",
                         (name.title(), exercise["id"]),
                     )
+        self._migrate_catalog_ownership()
+
+    def _migrate_catalog_ownership(self) -> None:
+        """Keep catalog IDs and links while replacing name uniqueness with per-owner indexes."""
+        with self.connect() as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("PRAGMA legacy_alter_table = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(equipment)")}
+            if "owner_id" not in columns:
+                for statement in (
+                    "ALTER TABLE equipment RENAME TO equipment_legacy",
+                    EQUIPMENT_TABLE,
+                    """INSERT INTO equipment(id,name,equipment_type,min_weight,max_weight,
+                    increment,unit,progression_direction,available,notes)
+                    SELECT id,name,equipment_type,min_weight,max_weight,increment,unit,
+                    progression_direction,available,notes FROM equipment_legacy""",
+                    "DROP TABLE equipment_legacy",
+                    "ALTER TABLE exercises RENAME TO exercises_legacy",
+                    EXERCISES_TABLE,
+                    """INSERT INTO exercises(id,canonical_name,category,orientation,
+                    equipment_type,default_unit,active,notes)
+                    SELECT id,canonical_name,category,orientation,equipment_type,
+                    default_unit,active,notes FROM exercises_legacy""",
+                    "DROP TABLE exercises_legacy",
+                    "ALTER TABLE exercise_aliases RENAME TO exercise_aliases_legacy",
+                    ALIASES_TABLE,
+                    """INSERT INTO exercise_aliases(id,alias,exercise_id)
+                    SELECT id,alias,exercise_id FROM exercise_aliases_legacy""",
+                    "DROP TABLE exercise_aliases_legacy",
+                ):
+                    connection.execute(statement)
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise sqlite3.IntegrityError("catalog migration failed foreign key validation")
+            for statement in (
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_equipment_shared_name
+                ON equipment(name) WHERE owner_id IS NULL""",
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_equipment_owner_name
+                ON equipment(owner_id,name) WHERE owner_id IS NOT NULL""",
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_exercise_shared_name
+                ON exercises(canonical_name) WHERE owner_id IS NULL""",
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_exercise_owner_name
+                ON exercises(owner_id,canonical_name) WHERE owner_id IS NOT NULL""",
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_alias_shared_name
+                ON exercise_aliases(alias) WHERE owner_id IS NULL""",
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_alias_owner_name
+                ON exercise_aliases(owner_id,alias) WHERE owner_id IS NOT NULL""",
+            ):
+                connection.execute(statement)
 
     def _migrate_legacy_workouts(self) -> None:
         """Restart-safely rebuild the legacy parent with non-null Geoff ownership."""

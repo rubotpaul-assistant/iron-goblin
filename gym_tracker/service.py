@@ -106,6 +106,8 @@ class GymService:
         unit: str = "lb",
         supported_weights: tuple[Decimal, ...] = (),
         progression_direction: str = "increase",
+        *,
+        owner_id: int | None = None,
     ) -> dict[str, Any]:
         """Create or restore a piece of available equipment."""
         normalized_loads = tuple(sorted(set(supported_weights)))
@@ -119,13 +121,14 @@ class GymService:
         if maximum < minimum or not equipment_range.contains(minimum):
             raise GymError("invalid equipment weight range")
         with self.database.connect() as connection:
-            connection.execute(
+            row = connection.execute(
                 """INSERT INTO equipment(
-                name,equipment_type,min_weight,max_weight,increment,unit,progression_direction)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET
+                name,equipment_type,min_weight,max_weight,increment,unit,progression_direction,
+                owner_id)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET
                 equipment_type=excluded.equipment_type,min_weight=excluded.min_weight,
                 max_weight=excluded.max_weight,increment=excluded.increment,unit=excluded.unit,
-                progression_direction=excluded.progression_direction,available=1""",
+                progression_direction=excluded.progression_direction,available=1 RETURNING id""",
                 (
                     name,
                     equipment_type,
@@ -134,13 +137,10 @@ class GymService:
                     float(increment),
                     unit,
                     progression_direction,
+                    owner_id,
                 ),
-            )
-            equipment_id = int(
-                connection.execute(
-                    "SELECT id FROM equipment WHERE name=? COLLATE NOCASE", (name,)
-                ).fetchone()["id"]
-            )
+            ).fetchone()
+            equipment_id = int(row["id"])
             connection.execute("DELETE FROM equipment_loads WHERE equipment_id=?", (equipment_id,))
             connection.executemany(
                 "INSERT INTO equipment_loads(equipment_id,weight) VALUES(?,?)",
@@ -410,37 +410,54 @@ class GymService:
             "methods": [profile["bmr_equation"], "net_exercise_or_imported_source"],
         }
 
-    def list_equipment(self) -> dict[str, Any]:
-        """List equipment without exposing configuration or credentials."""
+    def list_equipment(self, *, owner_id: int | None = None) -> dict[str, Any]:
+        """List shared equipment and the supplied owner's private equipment."""
         with self.database.connect() as connection:
+            connection.execute("BEGIN")
             rows = connection.execute(
-                """SELECT name,equipment_type,min_weight,max_weight,increment,unit,
+                """SELECT id,name,equipment_type,min_weight,max_weight,increment,unit,
                 progression_direction,available
-                FROM equipment ORDER BY name"""
+                FROM equipment WHERE owner_id IS NULL OR owner_id=?
+                ORDER BY name,owner_id IS NULL""",
+                (owner_id,),
             ).fetchall()
             loads = connection.execute(
-                """SELECT q.name,l.weight FROM equipment_loads l
-                JOIN equipment q ON q.id=l.equipment_id ORDER BY q.name,l.weight"""
+                """SELECT q.id,l.weight FROM equipment_loads l
+                JOIN equipment q ON q.id=l.equipment_id WHERE q.owner_id IS NULL OR q.owner_id=?
+                ORDER BY q.id,l.weight""",
+                (owner_id,),
             ).fetchall()
-        by_name: dict[str, list[float]] = {}
+        by_id: dict[int, list[float]] = {}
         for load in loads:
-            by_name.setdefault(str(load["name"]), []).append(float(load["weight"]))
+            by_id.setdefault(int(load["id"]), []).append(float(load["weight"]))
         equipment = []
         for row in rows:
             payload = dict(row)
-            payload["supported_weights"] = by_name.get(str(row["name"]), [])
+            payload["supported_weights"] = by_id.get(int(payload.pop("id")), [])
             equipment.append(payload)
         return {"ok": True, "equipment": equipment}
 
-    def assign_equipment(self, exercise: str, equipment: str) -> dict[str, Any]:
-        """Attach a known equipment load grid to an existing exercise."""
-        exercise_id = self._exercise_id(exercise)
+    @staticmethod
+    def _visible_equipment(
+        connection: sqlite3.Connection, name: str, owner_id: int | None
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """SELECT id,name FROM equipment WHERE name=? COLLATE NOCASE
+            AND (owner_id IS NULL OR owner_id=?) ORDER BY owner_id IS NULL LIMIT 1""",
+            (name, owner_id),
+        ).fetchone()
+        if row is None:
+            raise GymError(f"unknown equipment: {name}")
+        return cast("sqlite3.Row", row)
+
+    def assign_equipment(
+        self, exercise: str, equipment: str, *, owner_id: int | None = None
+    ) -> dict[str, Any]:
+        """Attach a visible load grid to an exercise the caller owns."""
         with self.database.connect() as connection:
-            equipment_row = connection.execute(
-                "SELECT id,name FROM equipment WHERE name=? COLLATE NOCASE", (equipment,)
-            ).fetchone()
-            if equipment_row is None:
-                raise GymError(f"unknown equipment: {equipment}")
+            connection.execute("BEGIN IMMEDIATE")
+            exercise_id = self._exercise_id(connection, exercise, owner_id, allow_shared=False)
+            equipment_row = self._visible_equipment(connection, equipment, owner_id)
             connection.execute(
                 """INSERT INTO exercise_equipment(exercise_id,equipment_id)
                 VALUES(?,?) ON CONFLICT(exercise_id,equipment_id) DO UPDATE SET required=1""",
@@ -448,11 +465,12 @@ class GymService:
             )
         return {"ok": True, "exercise": exercise, "equipment": equipment_row["name"]}
 
-    def remove_equipment(self, name: str) -> dict[str, Any]:
+    def remove_equipment(self, name: str, *, owner_id: int | None = None) -> dict[str, Any]:
         """Mark equipment unavailable without losing history."""
         with self.database.connect() as connection:
             result = connection.execute(
-                "UPDATE equipment SET available=0 WHERE name=? COLLATE NOCASE", (name,)
+                "UPDATE equipment SET available=0 WHERE name=? COLLATE NOCASE AND owner_id IS ?",
+                (name, owner_id),
             )
             if result.rowcount == 0:
                 raise GymError(f"unknown equipment: {name}")
@@ -466,48 +484,52 @@ class GymService:
         equipment_type: str,
         unit: str = "lb",
         equipment_name: str | None = None,
+        *,
+        owner_id: int | None = None,
     ) -> dict[str, Any]:
-        """Add a canonical classified exercise and optional equipment requirement."""
+        """Add a classified exercise and optional visible equipment requirement."""
         canonical_name = name.title() if name == name.lower() else name
         with self.database.connect() as connection:
             cursor = connection.execute(
                 """INSERT INTO exercises(
-                canonical_name,category,orientation,equipment_type,default_unit
-                ) VALUES(?,?,?,?,?)""",
-                (canonical_name, category.value, orientation.value, equipment_type, unit),
+                canonical_name,category,orientation,equipment_type,default_unit,owner_id
+                ) VALUES(?,?,?,?,?,?)""",
+                (canonical_name, category.value, orientation.value, equipment_type, unit, owner_id),
             )
             exercise_id = int(cursor.lastrowid or 0)
             if equipment_name:
-                equipment = connection.execute(
-                    "SELECT id FROM equipment WHERE name=? COLLATE NOCASE", (equipment_name,)
-                ).fetchone()
-                if equipment is None:
-                    raise GymError(f"unknown equipment: {equipment_name}")
+                equipment = self._visible_equipment(connection, equipment_name, owner_id)
                 connection.execute(
                     "INSERT INTO exercise_equipment(exercise_id,equipment_id) VALUES(?,?)",
                     (exercise_id, equipment["id"]),
                 )
         return {"ok": True, "exercise": canonical_name, "id": exercise_id}
 
-    def add_alias(self, alias: str, exercise: str) -> dict[str, Any]:
-        """Persist a user's wording for a known exercise."""
-        exercise_id = self._exercise_id(exercise)
+    def add_alias(
+        self, alias: str, exercise: str, *, owner_id: int | None = None
+    ) -> dict[str, Any]:
+        """Persist a user's wording for a visible exercise."""
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exercise_id = self._exercise_id(connection, exercise, owner_id)
             connection.execute(
-                "INSERT INTO exercise_aliases(alias,exercise_id) VALUES(?,?)", (alias, exercise_id)
+                "INSERT INTO exercise_aliases(alias,exercise_id,owner_id) VALUES(?,?,?)",
+                (alias, exercise_id, owner_id),
             )
         return {"ok": True, "alias": alias, "exercise": exercise}
 
-    def search_exercises(self, query: str) -> dict[str, Any]:
-        """Search canonical names and aliases deterministically."""
+    def search_exercises(self, query: str, *, owner_id: int | None = None) -> dict[str, Any]:
+        """Search shared and private exercise names and aliases."""
         pattern = f"%{query}%"
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT DISTINCT e.canonical_name,e.category,e.orientation,e.equipment_type
                 FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-                WHERE e.active=1 AND (e.canonical_name LIKE ? OR a.alias LIKE ?)
+                AND (a.owner_id IS NULL OR a.owner_id=?)
+                WHERE e.active=1 AND (e.owner_id IS NULL OR e.owner_id=?)
+                AND (e.canonical_name LIKE ? OR a.alias LIKE ?)
                 ORDER BY e.canonical_name""",
-                (pattern, pattern),
+                (owner_id, owner_id, pattern, pattern),
             ).fetchall()
         return {"ok": True, "matches": [dict(row) for row in rows]}
 
@@ -591,7 +613,7 @@ class GymService:
             tzinfo=PACIFIC,
         ).isoformat()
         with self.database.connect() as connection:
-            normalized = self._validate_bodyweight_results(connection, results)
+            normalized = self._validate_bodyweight_results(connection, results, user_id)
             duplicate_id = self._matching_bodyweight_workout(
                 connection, user_id, activity_date.isoformat(), normalized
             )
@@ -665,9 +687,9 @@ class GymService:
     def substitute_exercise(self, exercise: str, *, owner_id: int | None = None) -> dict[str, Any]:
         """Replace an unlogged active prescription with a same-plane/category exercise."""
         owner_id = self._strength_owner(owner_id)
-        exercise_id = self._exercise_id(exercise)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            exercise_id = self._exercise_id(connection, exercise, owner_id)
             workout = connection.execute(
                 "SELECT id,orientation FROM workout_sessions WHERE user_id=? AND status='active'",
                 (owner_id,),
@@ -679,6 +701,8 @@ class GymService:
                 FROM exercises WHERE id=? AND active=1""",
                 (exercise_id,),
             ).fetchone()
+            if candidate is None:
+                raise GymError(f"unknown exercise: {exercise}")
             if candidate["orientation"] != workout["orientation"]:
                 raise GymError("substitute must match the active workout orientation")
             prescribed = connection.execute(
@@ -727,10 +751,9 @@ class GymService:
         performed_date = self._performed_date(now)
         set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
         owner_id = self._strength_owner(owner_id)
-        exercise_id = self._exercise_id(exercise)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            workout_exercise = self._active_workout_exercise(connection, owner_id, exercise_id)
+            workout_exercise = self._active_workout_exercise(connection, owner_id, exercise)
             return self._store_strength_result(
                 connection,
                 workout_exercise,
@@ -1075,20 +1098,29 @@ class GymService:
             "sync_pending": True,
         }
 
-    def _exercise_id(self, name: str) -> int:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """SELECT e.id FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-                WHERE e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE LIMIT 1""",
-                (name, name),
-            ).fetchone()
+    @staticmethod
+    def _exercise_id(
+        connection: sqlite3.Connection,
+        name: str,
+        owner_id: int | None,
+        *,
+        allow_shared: bool = True,
+    ) -> int:
+        row = connection.execute(
+            """SELECT e.id FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
+            AND (a.owner_id IS NULL OR a.owner_id=?)
+            WHERE (e.owner_id IS ? OR (? AND e.owner_id IS NULL))
+            AND (e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
+            ORDER BY e.owner_id IS NULL,e.canonical_name<>? COLLATE NOCASE,e.id LIMIT 1""",
+            (owner_id, owner_id, allow_shared, name, name, name),
+        ).fetchone()
         if row is None:
             raise GymError(f"unknown exercise: {name}")
         return int(row["id"])
 
     @staticmethod
     def _validate_bodyweight_results(
-        connection: sqlite3.Connection, results: tuple[BodyweightResult, ...]
+        connection: sqlite3.Connection, results: tuple[BodyweightResult, ...], owner_id: int
     ) -> tuple[tuple[sqlite3.Row, tuple[int, ...], int], ...]:
         normalized: list[tuple[sqlite3.Row, tuple[int, ...], int]] = []
         exercise_ids: set[int] = set()
@@ -1100,12 +1132,13 @@ class GymService:
             if final_rir < 0 or final_rir > 3:
                 raise GymError("final-set RIR must be between 0 and 3")
             exercise = connection.execute(
-                """SELECT DISTINCT e.id,e.canonical_name,e.equipment_type,e.default_unit
+                """SELECT e.id,e.canonical_name,e.equipment_type,e.default_unit
                 FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-                WHERE e.active=1 AND (
+                AND (a.owner_id IS NULL OR a.owner_id=?)
+                WHERE e.active=1 AND (e.owner_id IS NULL OR e.owner_id=?) AND (
                  e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
-                LIMIT 1""",
-                (name, name),
+                ORDER BY e.owner_id IS NULL,e.id LIMIT 1""",
+                (owner_id, owner_id, name, name),
             ).fetchone()
             if exercise is None:
                 raise GymError(f"unknown exercise: {name}")
@@ -1258,14 +1291,16 @@ class GymService:
         for sequence, category in enumerate(Category, start=1):
             candidate = connection.execute(
                 """SELECT e.id,e.default_unit FROM exercises e
-                WHERE e.active=1 AND e.category=? AND e.orientation=? AND NOT EXISTS(
+                WHERE e.active=1 AND (e.owner_id IS NULL OR e.owner_id=?)
+                AND e.category=? AND e.orientation=? AND NOT EXISTS(
                  SELECT 1 FROM exercise_equipment ee JOIN equipment q ON q.id=ee.equipment_id
-                 WHERE ee.exercise_id=e.id AND ee.required=1 AND q.available=0)
+                 WHERE ee.exercise_id=e.id AND ee.required=1 AND q.available=0
+                 AND (q.owner_id IS NULL OR q.owner_id=e.owner_id))
                 ORDER BY COALESCE((SELECT MAX(ws.started_at) FROM workout_exercises wx
                  JOIN workout_sessions ws ON ws.id=wx.workout_session_id
                  WHERE wx.exercise_id=e.id AND ws.user_id=?),'') ASC,
-                 e.canonical_name ASC LIMIT 1""",
-                (category.value, orientation.value, owner_id),
+                 e.owner_id IS NULL,e.canonical_name ASC LIMIT 1""",
+                (owner_id, category.value, orientation.value, owner_id),
             ).fetchone()
             if candidate:
                 prescribed_weight, _ = self._prior_prescription(
@@ -1427,16 +1462,21 @@ class GymService:
         return [category.value for category in Category if category.value not in completed]
 
     def _active_workout_exercise(
-        self, connection: sqlite3.Connection, owner_id: int, exercise_id: int
+        self, connection: sqlite3.Connection, owner_id: int, name: str
     ) -> sqlite3.Row:
         row = connection.execute(
             """SELECT wx.id,wx.exercise_id,e.canonical_name
             FROM workout_exercises wx JOIN workout_sessions ws
             ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
-            WHERE ws.user_id=? AND ws.status='active' AND wx.exercise_id=?""",
-            (owner_id, exercise_id),
+            LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
+            AND (a.owner_id IS NULL OR a.owner_id=?)
+            WHERE ws.user_id=? AND ws.status='active' AND (e.owner_id IS NULL OR e.owner_id=?)
+            AND (e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
+            ORDER BY e.canonical_name<>? COLLATE NOCASE,wx.sequence LIMIT 1""",
+            (owner_id, owner_id, owner_id, name, name, name),
         ).fetchone()
         if row is None:
+            self._exercise_id(connection, name, owner_id)
             raise GymError("exercise is not prescribed in the active workout")
         return cast("sqlite3.Row", row)
 
@@ -1447,7 +1487,9 @@ class GymService:
         row = connection.execute(
             """SELECT q.id,q.min_weight,q.max_weight,q.increment,q.progression_direction
             FROM exercise_equipment ee
-            JOIN equipment q ON q.id=ee.equipment_id WHERE ee.exercise_id=? AND ee.required=1""",
+            JOIN equipment q ON q.id=ee.equipment_id JOIN exercises e ON e.id=ee.exercise_id
+            WHERE ee.exercise_id=? AND ee.required=1
+            AND (q.owner_id IS NULL OR q.owner_id=e.owner_id)""",
             (exercise_id,),
         ).fetchone()
         if row is None:
