@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS sync_state (
  last_success_at TEXT, last_error TEXT
 );
 INSERT OR IGNORE INTO sync_state(singleton,pending) VALUES(1,0);
+CREATE TABLE IF NOT EXISTS strength_replay_receipts (
+ owner_id INTEGER NOT NULL REFERENCES users(id), operation TEXT NOT NULL,
+ client_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ response_status INTEGER NOT NULL, response_body TEXT NOT NULL,
+ PRIMARY KEY(owner_id,operation,client_key)
+);
+CREATE TABLE IF NOT EXISTS strength_audit_events (
+ id INTEGER PRIMARY KEY, actor_id INTEGER NOT NULL REFERENCES users(id),
+ operation TEXT NOT NULL, workout_id INTEGER NOT NULL, prescription_id INTEGER NOT NULL,
+ outcome TEXT NOT NULL, request_id TEXT NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS user_identities (
  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), platform TEXT NOT NULL,
  external_sender_id TEXT NOT NULL, display_hint TEXT,

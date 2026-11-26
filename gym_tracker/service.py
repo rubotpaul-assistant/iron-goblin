@@ -753,6 +753,7 @@ class GymService:
         A caller with additional work, such as replay receipt storage, can acquire
         the write lock first with BEGIN IMMEDIATE. The connection context owns commit.
         """
+        self.validate_scheduled_result(result)
         if not connection.in_transaction:
             connection.execute("BEGIN IMMEDIATE")
         prescription = connection.execute(
@@ -775,12 +776,6 @@ class GymService:
             raise WorkoutStateConflict("workout or prescription has changed")
         if result.unit != prescription["unit"]:
             raise GymError("weight unit must match the prescription")
-        self._validate_strength_result(result.reps, result.final_rir)
-        if len(result.weights) != 3 or any(
-            not weight.is_finite() or weight < 0 or not isfinite(float(weight))
-            for weight in result.weights
-        ):
-            raise GymError("three finite non-negative loads are required")
         performed_date = self._performed_date(now)
         payload = self._store_strength_result(
             connection,
@@ -795,6 +790,16 @@ class GymService:
             "prescription_id": result.prescription_id,
             "performed_local_date": performed_date,
         }
+
+    @staticmethod
+    def validate_scheduled_result(result: ScheduledStrengthResult) -> None:
+        """Check intrinsic input before fingerprinting or accessing mutable workout state."""
+        GymService._validate_strength_result(result.reps, result.final_rir)
+        if len(result.weights) != 3 or any(
+            not weight.is_finite() or weight < 0 or not isfinite(float(weight))
+            for weight in result.weights
+        ):
+            raise GymError("three finite non-negative loads are required")
 
     @staticmethod
     def _validate_strength_result(reps: tuple[int, int, int], final_rir: int | None) -> None:
