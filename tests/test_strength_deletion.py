@@ -24,10 +24,12 @@ from gym_tracker.service import (
 )
 from gym_tracker.strength_replay import (
     ExerciseDeletion,
+    StrengthDeletion,
     correct_exercise_date_with_replay,
     record_prior_workout_with_replay,
     record_with_replay,
 )
+from gym_tracker.support_export import export_iron_account
 
 NOW = datetime(2026, 11, 26, 12, tzinfo=UTC)
 ZONE = ZoneInfo("Europe/London")
@@ -234,3 +236,38 @@ def test_delete_result_refreshes_a_workout_already_prescribed(tmp_path: Path) ->
         recommendation = service.current_workout(owner_id=1)["recommendations"][0]
         assert recommendation["weight"] == expected
     assert recommendation["weight_status"] == "baseline_required"
+
+
+def test_confirmed_workout_delete_retires_id_and_releases_schedule_slot(
+    scheduled: tuple[GymService, ScheduledStrengthResult],
+) -> None:
+    service, result = scheduled
+    other = service.begin_workout(scheduled=True, now=NOW, owner_id=2)
+    deletion = StrengthDeletion(secrets.token_bytes(32))
+    with pytest.raises(WorkoutRecordNotFound):
+        deletion.prepare_workout(service, 2, result.workout_id, now=NOW)
+
+    before = deletion.prepare_workout(service, 1, result.workout_id, now=NOW)
+    service.skip_workout()
+    with pytest.raises(WorkoutStateConflict, match="workout results have changed"):
+        deletion.confirm_workout(service, 1, before, "stale", uuid4(), now=NOW)
+
+    preview = deletion.prepare_workout(service, 1, result.workout_id, now=NOW)
+    deleted = deletion.confirm_workout(service, 1, preview, "delete-workout", uuid4(), now=NOW)
+    assert deleted.status == 200
+    assert (
+        deletion.confirm_workout(
+            service, 1, preview, "delete-workout", uuid4(), now=NOW + timedelta(hours=1)
+        )
+        == deleted
+    )
+    assert service.performed_history(1) == []
+    assert service.history_summary("geoff")["strength"]["raw_session_rows"] == 0
+    assert export_iron_account(service.database, 1)["records"]["workouts"] == []
+    assert {row["id"] for row in service.recent_history()["workouts"]} == {other["workout_id"]}
+    assert service.current_workout(owner_id=2)["workout_id"] == other["workout_id"]
+    assert record_with_replay(service, 1, result, "original", uuid4(), now=NOW).status == 404
+    with pytest.raises(WorkoutRecordNotFound):
+        record_with_replay(service, 1, result, "new-write", uuid4(), now=NOW)
+    replacement = service.begin_workout(scheduled=True, now=NOW, owner_id=1)
+    assert replacement["workout_id"] != result.workout_id

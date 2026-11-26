@@ -115,6 +115,13 @@ class PerformedExercise:
     result_revision: int
 
 
+@dataclass(frozen=True)
+class PerformedWorkout:
+    workout_id: int
+    status: str
+    results: tuple[PerformedExercise, ...]
+
+
 class GymService:
     """Own workout selection, mutation, history, and progression."""
 
@@ -832,7 +839,8 @@ class GymService:
             EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id) AS has_sets
             FROM workout_exercises wx JOIN workout_sessions ws
             ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
-            WHERE ws.id=? AND ws.user_id=? AND ws.source='scheduled' AND wx.id=?""",
+            WHERE ws.id=? AND ws.user_id=? AND ws.deleted_at IS NULL
+            AND ws.source='scheduled' AND wx.id=?""",
             (result.workout_id, owner_id, result.prescription_id),
         ).fetchone()
         if prescription is None:
@@ -1100,7 +1108,7 @@ class GymService:
         with self.database.connect() as connection:
             rows = connection.execute(
                 """SELECT id,started_at,completed_at,source,orientation,status
-                FROM workout_sessions ORDER BY started_at DESC LIMIT ?""",
+                FROM workout_sessions WHERE deleted_at IS NULL ORDER BY started_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
         return {"ok": True, "workouts": [dict(row) for row in rows]}
@@ -1165,7 +1173,8 @@ class GymService:
         with self.database.connect() as connection:
             raw_session_rows = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM workout_sessions WHERE user_id=?", (user_id,)
+                    "SELECT COUNT(*) FROM workout_sessions WHERE user_id=? AND deleted_at IS NULL",
+                    (user_id,),
                 ).fetchone()[0]
             )
             workout_rows = connection.execute(
@@ -1339,6 +1348,62 @@ class GymService:
             "prescription_id": target.prescription_id,
             "deleted": True,
         }
+
+    def preview_workout_deletion(self, owner_id: int, workout_id: int) -> PerformedWorkout:
+        """Read the current owned result revisions for a whole-workout confirmation."""
+        with self.database.connect() as connection:
+            return self._owned_performed_workout(connection, owner_id, workout_id)
+
+    def delete_performed_workout(
+        self, connection: sqlite3.Connection, owner_id: int, target: PerformedWorkout
+    ) -> dict[str, Any]:
+        """Remove every result in the confirmed workout and retire the canonical workout ID."""
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        current = self._owned_performed_workout(connection, owner_id, target.workout_id)
+        if target != current:
+            raise WorkoutStateConflict("workout results have changed")
+        results = [
+            self.delete_performed_exercise(connection, owner_id, exercise)
+            for exercise in target.results
+        ]
+        connection.execute(
+            """UPDATE workout_exercises SET status='deleted',prescribed_weight=NULL
+            WHERE workout_session_id=?""",
+            (target.workout_id,),
+        )
+        connection.execute(
+            """UPDATE workout_sessions SET deleted_at=CURRENT_TIMESTAMP,
+            started_at='',local_date='',completed_at=NULL,source='manual',orientation='mixed',
+            status='skipped',notes='' WHERE id=? AND user_id=?""",
+            (target.workout_id, owner_id),
+        )
+        return {
+            "ok": True,
+            "workout_id": target.workout_id,
+            "deleted": True,
+            "exercises": [{"prescription_id": result["prescription_id"]} for result in results],
+        }
+
+    @staticmethod
+    def _owned_performed_workout(
+        connection: sqlite3.Connection, owner_id: int, workout_id: int
+    ) -> PerformedWorkout:
+        rows = connection.execute(
+            """SELECT ws.status,wx.id,wx.result_revision FROM workout_sessions ws
+            JOIN workout_exercises wx ON ws.id=wx.workout_session_id
+            WHERE ws.user_id=? AND ws.id=? AND ws.deleted_at IS NULL
+            AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)
+            ORDER BY wx.id""",
+            (owner_id, workout_id),
+        ).fetchall()
+        if not rows:
+            raise WorkoutRecordNotFound("workout or prescription not found")
+        results = tuple(
+            PerformedExercise(workout_id, int(row["id"]), int(row["result_revision"]))
+            for row in rows
+        )
+        return PerformedWorkout(workout_id, str(rows[0]["status"]), results)
 
     @staticmethod
     def _owned_performed_exercise(

@@ -6,7 +6,9 @@ from gym_tracker.db import Database
 from gym_tracker.service import WorkoutRecordNotFound
 
 EXPORT_QUERIES = {
-    "workouts": "SELECT * FROM workout_sessions WHERE user_id=? ORDER BY id",
+    "workouts": """
+        SELECT * FROM workout_sessions WHERE user_id=? AND deleted_at IS NULL ORDER BY id
+    """,
     "workout_exercises": """
         SELECT wx.*,e.canonical_name,e.category,e.orientation,e.equipment_type
         FROM workout_exercises wx JOIN workout_sessions ws ON ws.id=wx.workout_session_id

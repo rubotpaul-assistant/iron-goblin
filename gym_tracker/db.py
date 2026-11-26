@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS workout_sessions (
  local_date TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('scheduled','manual')),
  orientation TEXT NOT NULL CHECK(orientation IN ('horizontal','vertical','mixed')),
  status TEXT NOT NULL CHECK(status IN ('planned','active','partial','completed','skipped')),
- notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id)
+ notes TEXT NOT NULL DEFAULT '', user_id INTEGER NOT NULL REFERENCES users(id), deleted_at TEXT
 );
 BEGIN IMMEDIATE;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_owner_scheduled_day
@@ -163,6 +163,12 @@ class Database:
         self._migrate_legacy_sets()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            workout_columns = {
+                str(column["name"])
+                for column in connection.execute("PRAGMA table_info(workout_sessions)")
+            }
+            if "deleted_at" not in workout_columns:
+                connection.execute("ALTER TABLE workout_sessions ADD COLUMN deleted_at TEXT")
             columns = {
                 str(column["name"])
                 for column in connection.execute("PRAGMA table_info(workout_exercises)")
