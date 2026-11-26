@@ -25,6 +25,7 @@ from gym_tracker.domain import (
     parse_weight_kg,
     progression_weight,
 )
+from gym_tracker.pilot_account import EventDay
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
@@ -82,6 +83,16 @@ class ScheduledStrengthResult:
     workout_id: int
     prescription_id: int
     expected_exercise_id: int
+    weights: tuple[Decimal, Decimal, Decimal]
+    reps: tuple[int, int, int]
+    unit: str
+    final_rir: int
+    technical_failure: bool = False
+
+
+@dataclass(frozen=True)
+class PriorStrengthResult:
+    exercise_id: int
     weights: tuple[Decimal, Decimal, Decimal]
     reps: tuple[int, int, int]
     unit: str
@@ -750,7 +761,7 @@ class GymService:
     ) -> dict[str, Any]:
         """Atomically attach a three-set result to the active workout."""
         self._validate_strength_result(reps, final_rir)
-        performed_at = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC)
+        performed = self._strength_event(now, PACIFIC)
         set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
         owner_id = self._strength_owner(owner_id)
         with self.database.connect() as connection:
@@ -762,8 +773,7 @@ class GymService:
                 set_weights,
                 Performance(reps, final_rir, technical_failure),
                 unit,
-                performed_at,
-                PACIFIC,
+                performed,
             )
 
     def active_scheduled_workout(self, owner_id: int) -> dict[str, Any] | None:
@@ -798,7 +808,7 @@ class GymService:
         A caller with additional work, such as replay receipt storage, can acquire
         the write lock first with BEGIN IMMEDIATE. The connection context owns commit.
         """
-        self.validate_scheduled_result(result)
+        self.validate_strength_values(result)
         if not connection.in_transaction:
             connection.execute("BEGIN IMMEDIATE")
         prescription = connection.execute(
@@ -821,24 +831,118 @@ class GymService:
             raise WorkoutStateConflict("workout or prescription has changed")
         if result.unit != prescription["unit"]:
             raise GymError("weight unit must match the prescription")
-        performed_at = (now or datetime.now(tz=time_zone)).astimezone(time_zone)
+        performed = self._strength_event(now, time_zone)
         payload = self._store_strength_result(
             connection,
             prescription,
             result.weights,
             Performance(result.reps, result.final_rir, result.technical_failure),
             result.unit,
-            performed_at,
-            time_zone,
+            performed,
         )
         return payload | {
             "workout_id": result.workout_id,
             "prescription_id": result.prescription_id,
-            "performed_local_date": performed_at.date().isoformat(),
+            "performed_local_date": performed.local_date.isoformat(),
+        }
+
+    def record_prior_strength_workout(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        performed_date: date,
+        results: tuple[PriorStrengthResult, ...],
+        *,
+        time_zone: ZoneInfo,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Record a date-only baseline without advancing the scheduled orientation cycle."""
+        self.validate_prior_strength_results(results)
+        if performed_date > self._strength_event(now, time_zone).local_date:
+            raise GymError("a prior workout cannot be in the future")
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        local_date = performed_date.isoformat()
+        event = EventDay(None, None, time_zone.key, performed_date, True)
+        cursor = connection.execute(
+            """INSERT INTO workout_sessions(started_at,local_date,source,orientation,status,user_id)
+            VALUES(?,?,'manual','mixed','completed',?)""",
+            (local_date, local_date, owner_id),
+        )
+        workout_id = int(cursor.lastrowid or 0)
+        performed = []
+        for sequence, result in enumerate(results, start=1):
+            exercise = connection.execute(
+                """SELECT canonical_name,default_unit,equipment_type FROM exercises
+                WHERE id=? AND active=1 AND (owner_id IS NULL OR owner_id=?)""",
+                (result.exercise_id, owner_id),
+            ).fetchone()
+            if exercise is None:
+                raise WorkoutRecordNotFound("exercise not found")
+            if result.unit != exercise["default_unit"]:
+                raise GymError("weight unit must match the exercise")
+            equipment = connection.execute(
+                """SELECT q.unit FROM exercise_equipment ee JOIN equipment q ON q.id=ee.equipment_id
+                JOIN exercises e ON e.id=ee.exercise_id WHERE ee.exercise_id=? AND ee.required=1
+                AND (q.owner_id IS NULL OR q.owner_id=e.owner_id) LIMIT 2""",
+                (result.exercise_id,),
+            ).fetchall()
+            if exercise["equipment_type"] != "bodyweight" and len(equipment) != 1:
+                raise GymError("prior strength requires a known equipment load grid")
+            if equipment and equipment[0]["unit"] != result.unit:
+                raise GymError("weight unit must match the equipment")
+            cursor = connection.execute(
+                """INSERT INTO workout_exercises(workout_session_id,exercise_id,unit,sequence)
+                VALUES(?,?,?,?)""",
+                (workout_id, result.exercise_id, result.unit, sequence),
+            )
+            prescription_id = int(cursor.lastrowid or 0)
+            prescription = {
+                "id": prescription_id,
+                "exercise_id": result.exercise_id,
+                "canonical_name": exercise["canonical_name"],
+            }
+            logged = self._store_strength_result(
+                connection,
+                prescription,
+                result.weights,
+                Performance(result.reps, result.final_rir, result.technical_failure),
+                result.unit,
+                event,
+            )
+            performed.append(
+                logged
+                | {
+                    "prescription_id": prescription_id,
+                    "exercise_id": result.exercise_id,
+                }
+            )
+        return {
+            "ok": True,
+            "workout_id": workout_id,
+            "status": "completed",
+            "performed_local_date": local_date,
+            "exercises": performed,
         }
 
     @staticmethod
-    def validate_scheduled_result(result: ScheduledStrengthResult) -> None:
+    def validate_prior_strength_results(results: tuple[PriorStrengthResult, ...]) -> None:
+        if not 1 <= len(results) <= 20:
+            raise GymError("a prior workout requires between 1 and 20 exercises")
+        if len({result.exercise_id for result in results}) != len(results):
+            raise GymError("an exercise may appear only once in a prior workout")
+        for result in results:
+            GymService.validate_strength_values(result)
+
+    @staticmethod
+    def _strength_event(now: datetime | None, time_zone: ZoneInfo) -> EventDay:
+        performed = (now or datetime.now(tz=time_zone)).astimezone(time_zone)
+        return EventDay(
+            performed.astimezone(UTC), performed.utcoffset(), time_zone.key, performed.date(), False
+        )
+
+    @staticmethod
+    def validate_strength_values(result: ScheduledStrengthResult | PriorStrengthResult) -> None:
         """Check intrinsic input before fingerprinting or accessing mutable workout state."""
         GymService._validate_strength_result(result.reps, result.final_rir)
         if len(result.weights) != 3 or any(
@@ -861,12 +965,11 @@ class GymService:
     def _store_strength_result(
         self,
         connection: sqlite3.Connection,
-        workout_exercise: sqlite3.Row,
+        workout_exercise: sqlite3.Row | dict[str, Any],
         set_weights: tuple[Decimal, Decimal, Decimal],
         performance: Performance,
         unit: str,
-        performed_at: datetime,
-        time_zone: ZoneInfo,
+        performed: EventDay,
     ) -> dict[str, Any]:
         reps, final_rir, technical_failure = (
             performance.reps,
@@ -898,11 +1001,12 @@ class GymService:
         connection.execute(
             """UPDATE workout_exercises
             SET status='completed',performed_local_date=?,performed_at_utc=?,performed_time_zone=?,
-            performed_date_explicit=0 WHERE id=?""",
+            performed_date_explicit=? WHERE id=?""",
             (
-                performed_at.date().isoformat(),
-                performed_at.astimezone(UTC).isoformat(),
-                time_zone.key,
+                performed.local_date.isoformat(),
+                performed.occurred_at_utc.isoformat() if performed.occurred_at_utc else None,
+                performed.account_time_zone,
+                int(performed.explicit_local_date),
                 workout_exercise["id"],
             ),
         )
