@@ -1,6 +1,7 @@
 """Application service integration tests against real SQLite."""
 
-from datetime import datetime
+from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -9,7 +10,13 @@ import pytest
 
 from gym_tracker.db import Database
 from gym_tracker.domain import Category, Orientation
-from gym_tracker.service import GymError, GymService
+from gym_tracker.service import (
+    GymError,
+    GymService,
+    ScheduledStrengthResult,
+    WorkoutRecordNotFound,
+    WorkoutStateConflict,
+)
 
 
 @pytest.fixture
@@ -620,3 +627,165 @@ def test_imported_calories_take_precedence_and_missing_profile_is_structured(
     )
     assert result["calorie_method"] == "health_connect"
     assert service.daily_calories("freedom", "2026-08-18")["cardio_net_kcal"] == 222
+
+
+@pytest.fixture
+def scheduled_result(service: GymService) -> ScheduledStrengthResult:
+    service.begin_workout(scheduled=True)
+    active = service.active_scheduled_workout(1)
+    assert active is not None
+    assert active["status"] == "active"
+    prescription = active["prescriptions"][0]
+    assert prescription["status"] == "prescribed"
+    return ScheduledStrengthResult(
+        active["workout_id"],
+        prescription["prescription_id"],
+        prescription["exercise_id"],
+        (Decimal(70), Decimal(80), Decimal(90)),
+        (6, 5, 5),
+        prescription["unit"],
+        1,
+    )
+
+
+def test_scheduled_strength_result_is_owner_scoped_and_matches_cli_progression(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    assert service.active_scheduled_workout(2) is None
+    assert service.performed_history(1) == []
+    now = datetime(2026, 11, 27, 1, tzinfo=UTC)
+    with service.database.connect() as connection:
+        result = service.record_scheduled_result(connection, 1, scheduled_result, now=now)
+
+    assert result["workout_id"] == scheduled_result.workout_id
+    assert result["prescription_id"] == scheduled_result.prescription_id
+    assert result["performed_local_date"] == "2026-11-26"
+    active = service.active_scheduled_workout(1)
+    assert active is not None
+    assert active["prescriptions"][0]["status"] == "completed"
+    (workout,) = service.performed_history(1)
+    assert workout["workout_id"] == result["workout_id"]
+    assert workout["status"] == "active"
+    assert workout["local_date"] == "2026-11-26"
+    assert [row["weight"] for row in workout["sets"]] == [70, 80, 90]
+    assert [row["completed_reps"] for row in workout["sets"]] == [6, 5, 5]
+    assert [row["rir"] for row in workout["sets"]] == [None, None, 1]
+    assert {row["prescription_id"] for row in workout["sets"]} == {result["prescription_id"]}
+    assert service.performed_history(2) == []
+    with pytest.raises(WorkoutStateConflict), service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, scheduled_result)
+
+    cli_result = service.log_exercise(
+        result["exercise"], scheduled_result.weights, scheduled_result.reps, final_rir=1, now=now
+    )
+    assert cli_result == {
+        key: value
+        for key, value in result.items()
+        if key not in {"workout_id", "prescription_id", "performed_local_date"}
+    }
+    service.skip_workout()
+    assert service.performed_history(1)[0]["status"] == "partial"
+    assert service.active_scheduled_workout(1) is None
+    with pytest.raises(WorkoutStateConflict), service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, scheduled_result)
+
+
+def test_foreign_workout_and_missing_prescription_have_same_error(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    for owner_id, result in (
+        (2, scheduled_result),
+        (1, replace(scheduled_result, workout_id=-1)),
+        (1, replace(scheduled_result, prescription_id=-1)),
+    ):
+        with (
+            pytest.raises(WorkoutRecordNotFound, match=r"^workout or prescription not found$"),
+            service.database.connect() as connection,
+        ):
+            service.record_scheduled_result(connection, owner_id, result)
+
+
+def test_substitution_invalidates_discovered_exercise_identity(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    active = service.active_scheduled_workout(1)
+    assert active is not None
+    current = service.current_workout()["recommendations"][0]
+    service.add_exercise(
+        "replacement", Category(current["category"]), Orientation.VERTICAL, "machine"
+    )
+    service.substitute_exercise("replacement")
+    changed = service.active_scheduled_workout(1)
+    assert changed is not None
+    assert changed["prescriptions"][0]["prescription_id"] == scheduled_result.prescription_id
+    assert changed["prescriptions"][0]["exercise_id"] != scheduled_result.expected_exercise_id
+    with pytest.raises(WorkoutStateConflict), service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, scheduled_result)
+    assert service.performed_history(1) == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"weights": (Decimal(70), Decimal(80), Decimal("NaN"))}, "finite non-negative"),
+        ({"weights": (Decimal(70), Decimal(80), Decimal("1e400"))}, "finite non-negative"),
+        ({"weights": (Decimal(70), Decimal(80), Decimal(-1))}, "finite non-negative"),
+        ({"weights": (Decimal(70), Decimal(80))}, "three finite"),
+        ({"weights": (Decimal(70), Decimal(80), Decimal(95))}, "not supported"),
+        ({"final_rir": 4}, "between 0 and 3"),
+        ({"reps": (5, -1, 5)}, "non-negative"),
+        ({"reps": (5, 5)}, "three rep counts"),
+        ({"unit": "kg"}, "unit must match"),
+    ],
+)
+def test_scheduled_result_rejects_invalid_values(
+    service: GymService,
+    scheduled_result: ScheduledStrengthResult,
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    result = replace(scheduled_result, **changes)
+    with pytest.raises(GymError, match=message), service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, result)
+    assert service.performed_history(1) == []
+
+
+def test_scheduled_result_rolls_back_with_caller_transaction(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    def write_then_fail() -> None:
+        with service.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            service.record_scheduled_result(connection, 1, scheduled_result)
+            assert connection.execute("SELECT COUNT(*) FROM sets").fetchone()[0] == 3
+            raise RuntimeError("receipt failed")
+
+    with pytest.raises(RuntimeError, match="receipt failed"):
+        write_then_fail()
+    assert service.performed_history(1) == []
+    workout = service.active_scheduled_workout(1)
+    assert workout is not None
+    assert workout["prescriptions"][0]["status"] == "prescribed"
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT pending FROM sync_state").fetchone()[0] == 0
+
+
+def test_performed_history_limit_is_applied_to_workouts_before_sets(
+    service: GymService, scheduled_result: ScheduledStrengthResult
+) -> None:
+    with service.database.connect() as connection:
+        service.record_scheduled_result(connection, 1, scheduled_result)
+    service.skip_workout()
+    second = service.begin_workout()
+    assert service.active_scheduled_workout(1) is None
+    service.log_exercise(
+        second["recommendations"][0]["exercise"], Decimal(90), (5, 5, 5), final_rir=0
+    )
+    # Tie the starting timestamps to exercise the canonical ID tiebreaker.
+    with service.database.connect() as connection:
+        connection.execute("UPDATE workout_sessions SET started_at='2026-11-26T12:00:00-08:00'")
+    (recent,) = service.performed_history(1, limit=1)
+    assert recent["workout_id"] == second["workout_id"]
+    assert len(recent["sets"]) == 3
+    with pytest.raises(GymError, match="limit must be between"):
+        service.performed_history(1, limit=0)

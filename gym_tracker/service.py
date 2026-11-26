@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from math import isfinite
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -65,6 +67,26 @@ BodyweightResult = tuple[str, tuple[int, ...], int]
 
 class GymError(Exception):
     """Expected domain or input error."""
+
+
+class WorkoutRecordNotFound(GymError):
+    """A requested workout or prescription is missing or inaccessible."""
+
+
+class WorkoutStateConflict(GymError):
+    """The owned workout or prescription changed since discovery."""
+
+
+@dataclass(frozen=True)
+class ScheduledStrengthResult:
+    workout_id: int
+    prescription_id: int
+    expected_exercise_id: int
+    weights: tuple[Decimal, Decimal, Decimal]
+    reps: tuple[int, int, int]
+    unit: str
+    final_rir: int
+    technical_failure: bool = False
 
 
 class GymService:
@@ -686,52 +708,155 @@ class GymService:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically attach a three-set result to the active workout."""
+        self._validate_strength_result(reps, final_rir)
+        performed_date = self._performed_date(now)
+        set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
+        with self.database.connect() as connection:
+            workout_exercise = self._active_workout_exercise(connection, exercise)
+            return self._store_strength_result(
+                connection,
+                workout_exercise,
+                set_weights,
+                Performance(reps, final_rir, technical_failure),
+                unit,
+                performed_date,
+            )
+
+    def active_scheduled_workout(self, owner_id: int) -> dict[str, Any] | None:
+        """Discover the owner's active scheduled workout and its prescription references."""
+        with self.database.connect() as connection:
+            connection.execute("BEGIN")
+            workout = connection.execute(
+                """SELECT id AS workout_id,status FROM workout_sessions
+                WHERE user_id=? AND source='scheduled' AND status='active'""",
+                (owner_id,),
+            ).fetchone()
+            if workout is None:
+                return None
+            prescriptions = connection.execute(
+                """SELECT id AS prescription_id,exercise_id,status,unit FROM workout_exercises
+                WHERE workout_session_id=? ORDER BY sequence""",
+                (workout["workout_id"],),
+            )
+            return dict(workout) | {"prescriptions": [dict(row) for row in prescriptions]}
+
+    def record_scheduled_result(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        result: ScheduledStrengthResult,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Record one owned prescription in the caller's write transaction.
+
+        A caller with additional work, such as replay receipt storage, can acquire
+        the write lock first with BEGIN IMMEDIATE. The connection context owns commit.
+        """
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        prescription = connection.execute(
+            """SELECT wx.id,wx.exercise_id,wx.unit,wx.status,e.canonical_name,
+            ws.status AS workout_status,
+            EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id) AS has_sets
+            FROM workout_exercises wx JOIN workout_sessions ws
+            ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
+            WHERE ws.id=? AND ws.user_id=? AND ws.source='scheduled' AND wx.id=?""",
+            (result.workout_id, owner_id, result.prescription_id),
+        ).fetchone()
+        if prescription is None:
+            raise WorkoutRecordNotFound("workout or prescription not found")
+        if (
+            prescription["workout_status"] != "active"
+            or prescription["status"] != "prescribed"
+            or prescription["has_sets"]
+            or prescription["exercise_id"] != result.expected_exercise_id
+        ):
+            raise WorkoutStateConflict("workout or prescription has changed")
+        if result.unit != prescription["unit"]:
+            raise GymError("weight unit must match the prescription")
+        self._validate_strength_result(result.reps, result.final_rir)
+        if len(result.weights) != 3 or any(
+            not weight.is_finite() or weight < 0 or not isfinite(float(weight))
+            for weight in result.weights
+        ):
+            raise GymError("three finite non-negative loads are required")
+        performed_date = self._performed_date(now)
+        payload = self._store_strength_result(
+            connection,
+            prescription,
+            result.weights,
+            Performance(result.reps, result.final_rir, result.technical_failure),
+            result.unit,
+            performed_date,
+        )
+        return payload | {
+            "workout_id": result.workout_id,
+            "prescription_id": result.prescription_id,
+            "performed_local_date": performed_date,
+        }
+
+    @staticmethod
+    def _validate_strength_result(reps: tuple[int, int, int], final_rir: int | None) -> None:
+        if len(reps) != 3:
+            raise GymError("three rep counts are required")
         if any(repetition < 0 for repetition in reps):
             raise GymError("reps must be non-negative")
         if final_rir is None:
             raise GymError("final-set RIR is required")
         if final_rir < 0 or final_rir > 3:
             raise GymError("final-set RIR must be between 0 and 3")
-        performed_date = (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC).date().isoformat()
-        set_weights = weight if isinstance(weight, tuple) else (weight, weight, weight)
-        with self.database.connect() as connection:
-            workout_exercise = self._active_workout_exercise(connection, exercise)
-            equipment = self._equipment_for_exercise(
-                connection, int(workout_exercise["exercise_id"])
-            )
-            if equipment and any(not equipment.contains(set_weight) for set_weight in set_weights):
-                raise GymError("weight is not supported by the required equipment")
-            for set_number, (completed_reps, set_weight) in enumerate(
-                zip(reps, set_weights, strict=True), start=1
-            ):
-                connection.execute(
-                    """INSERT INTO sets(
-                    workout_exercise_id,set_number,completed_reps,weight,unit,rir,technical_failure)
-                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(workout_exercise_id,set_number) DO UPDATE SET
-                    completed_reps=excluded.completed_reps,weight=excluded.weight,unit=excluded.unit,
-                    rir=excluded.rir,technical_failure=excluded.technical_failure""",
-                    (
-                        workout_exercise["id"],
-                        set_number,
-                        completed_reps,
-                        float(set_weight),
-                        unit,
-                        final_rir if set_number == 3 else None,
-                        int(technical_failure and set_number == 3),
-                    ),
-                )
+
+    @staticmethod
+    def _performed_date(now: datetime | None) -> str:
+        return (now or datetime.now(tz=PACIFIC)).astimezone(PACIFIC).date().isoformat()
+
+    def _store_strength_result(
+        self,
+        connection: sqlite3.Connection,
+        workout_exercise: sqlite3.Row,
+        set_weights: tuple[Decimal, Decimal, Decimal],
+        performance: Performance,
+        unit: str,
+        performed_date: str,
+    ) -> dict[str, Any]:
+        reps, final_rir, technical_failure = (
+            performance.reps,
+            performance.final_rir,
+            performance.technical_failure,
+        )
+        equipment = self._equipment_for_exercise(connection, int(workout_exercise["exercise_id"]))
+        if equipment and any(not equipment.contains(set_weight) for set_weight in set_weights):
+            raise GymError("weight is not supported by the required equipment")
+        for set_number, (completed_reps, set_weight) in enumerate(
+            zip(reps, set_weights, strict=True), start=1
+        ):
             connection.execute(
-                """UPDATE workout_exercises
-                SET status='completed',performed_local_date=? WHERE id=?""",
-                (performed_date, workout_exercise["id"]),
+                """INSERT INTO sets(
+                workout_exercise_id,set_number,completed_reps,weight,unit,rir,technical_failure)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(workout_exercise_id,set_number) DO UPDATE SET
+                completed_reps=excluded.completed_reps,weight=excluded.weight,unit=excluded.unit,
+                rir=excluded.rir,technical_failure=excluded.technical_failure""",
+                (
+                    workout_exercise["id"],
+                    set_number,
+                    completed_reps,
+                    float(set_weight),
+                    unit,
+                    final_rir if set_number == 3 else None,
+                    int(technical_failure and set_number == 3),
+                ),
             )
-            working_weight = set_weights[-1]
-            next_weight, reason = (working_weight, "baseline_recorded")
-            if equipment:
-                next_weight, reason = progression_weight(
-                    working_weight, Performance(reps, final_rir, technical_failure), equipment
-                )
-            connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
+        connection.execute(
+            """UPDATE workout_exercises
+            SET status='completed',performed_local_date=? WHERE id=?""",
+            (performed_date, workout_exercise["id"]),
+        )
+        working_weight = set_weights[-1]
+        next_weight, reason = (working_weight, "baseline_recorded")
+        if equipment:
+            next_weight, reason = progression_weight(working_weight, performance, equipment)
+        connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
         return {
             "ok": True,
             "exercise": workout_exercise["canonical_name"],
@@ -800,6 +925,42 @@ class GymService:
                 (limit,),
             ).fetchall()
         return {"ok": True, "workouts": [dict(row) for row in rows]}
+
+    def performed_history(self, owner_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the most recent owned workouts with recorded sets and canonical IDs."""
+        if not 1 <= limit <= 100:
+            raise GymError("limit must be between 1 and 100")
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """WITH performed AS (
+                    SELECT ws.id,ws.status,ws.started_at,
+                    COALESCE(MIN(wx.performed_local_date),ws.local_date) AS local_date
+                    FROM workout_sessions ws
+                    JOIN workout_exercises wx ON wx.workout_session_id=ws.id
+                    JOIN sets s ON s.workout_exercise_id=wx.id
+                    WHERE ws.user_id=?
+                    GROUP BY ws.id ORDER BY ws.started_at DESC,ws.id DESC LIMIT ?
+                )
+                SELECT p.id AS workout_id,p.status,p.local_date,wx.id AS prescription_id,
+                wx.exercise_id,wx.performed_local_date,s.id AS set_id,s.set_number,
+                s.completed_reps,s.weight,s.unit,s.rir,s.technical_failure
+                FROM performed p JOIN workout_exercises wx ON wx.workout_session_id=p.id
+                JOIN sets s ON s.workout_exercise_id=wx.id
+                ORDER BY p.started_at DESC,p.id DESC,wx.sequence,s.set_number""",
+                (owner_id, limit),
+            ).fetchall()
+        workouts: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            evidence = dict(row)
+            workout_id = evidence.pop("workout_id")
+            status = evidence.pop("status")
+            local_date = evidence.pop("local_date")
+            workout = workouts.setdefault(
+                workout_id,
+                {"workout_id": workout_id, "status": status, "local_date": local_date, "sets": []},
+            )
+            workout["sets"].append(evidence)
+        return list(workouts.values())
 
     def history_summary(self, user: str) -> dict[str, Any]:
         """Summarize user history from recorded sets, excluding empty session shells."""
