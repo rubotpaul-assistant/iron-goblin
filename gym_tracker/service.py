@@ -1323,6 +1323,15 @@ class GymService:
                 target.prescription_id,
             ),
         )
+        connection.execute(
+            """UPDATE workout_exercises SET prescribed_weight=NULL
+            WHERE exercise_id=? AND status='prescribed' AND workout_session_id IN (
+                SELECT id FROM workout_sessions WHERE user_id=? AND status IN ('active','planned')
+            ) AND NOT EXISTS (
+                SELECT 1 FROM sets WHERE sets.workout_exercise_id=workout_exercises.id
+            )""",
+            (row["exercise_id"], owner_id),
+        )
         connection.execute("UPDATE sync_state SET pending=1 WHERE singleton=1")
         return {
             "ok": True,
@@ -1336,7 +1345,7 @@ class GymService:
         connection: sqlite3.Connection, owner_id: int, workout_id: int, prescription_id: int
     ) -> sqlite3.Row:
         row = connection.execute(
-            """SELECT wx.result_revision,ws.status FROM workout_exercises wx
+            """SELECT wx.result_revision,wx.exercise_id,ws.status FROM workout_exercises wx
             JOIN workout_sessions ws ON ws.id=wx.workout_session_id
             WHERE ws.user_id=? AND ws.id=? AND wx.id=?
             AND EXISTS(SELECT 1 FROM sets s WHERE s.workout_exercise_id=wx.id)""",

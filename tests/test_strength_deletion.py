@@ -193,3 +193,44 @@ def test_existing_set_rows_keep_ids_when_installing_non_reuse_migration(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='sets'"
         ).fetchone()[0]
         assert "AUTOINCREMENT" in sql
+
+
+def test_delete_result_refreshes_a_workout_already_prescribed(tmp_path: Path) -> None:
+    service = GymService(Database(tmp_path / "recommendation.sqlite3"))
+    service.add_equipment("press", "machine", Decimal(10), Decimal(100), Decimal(10), owner_id=1)
+    exercise = service.add_exercise(
+        "press",
+        Category.PUSH,
+        Orientation.VERTICAL,
+        "machine",
+        equipment_name="press",
+        owner_id=1,
+    )
+    records = []
+    for day, load in ((date(2026, 11, 24), 50), (date(2026, 11, 25), 70)):
+        result = PriorStrengthResult(exercise["id"], (Decimal(load),) * 3, (5, 5, 5), "lb", 1)
+        created = record_prior_workout_with_replay(
+            service,
+            1,
+            day,
+            (result,),
+            day.isoformat(),
+            uuid4(),
+            time_zone=ZONE,
+            now=NOW,
+        )
+        records.append(json.loads(created.body))
+    assert (
+        service.begin_workout(scheduled=True, now=NOW, owner_id=1)["recommendations"][0]["weight"]
+        == 80
+    )
+
+    deletion = ExerciseDeletion(secrets.token_bytes(32))
+    for record, expected in ((records[-1], 60), (records[0], None)):
+        preview = deletion.prepare(
+            service, 1, record["workout_id"], record["exercises"][0]["prescription_id"], now=NOW
+        )
+        deletion.confirm(service, 1, preview, str(record["workout_id"]), uuid4(), now=NOW)
+        recommendation = service.current_workout(owner_id=1)["recommendations"][0]
+        assert recommendation["weight"] == expected
+    assert recommendation["weight_status"] == "baseline_required"
