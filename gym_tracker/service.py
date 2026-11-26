@@ -1108,11 +1108,12 @@ class GymService:
     ) -> int:
         row = connection.execute(
             """SELECT e.id FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-            AND (a.owner_id IS NULL OR a.owner_id=?)
+            AND a.alias=? COLLATE NOCASE AND (a.owner_id IS NULL OR a.owner_id=?)
             WHERE (e.owner_id IS ? OR (? AND e.owner_id IS NULL))
-            AND (e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
-            ORDER BY e.owner_id IS NULL,e.canonical_name<>? COLLATE NOCASE,e.id LIMIT 1""",
-            (owner_id, owner_id, allow_shared, name, name, name),
+            AND (e.canonical_name=? COLLATE NOCASE OR a.id IS NOT NULL)
+            ORDER BY e.canonical_name<>? COLLATE NOCASE,e.owner_id IS NULL,a.owner_id IS NULL,e.id
+            LIMIT 1""",
+            (name, owner_id, owner_id, allow_shared, name, name),
         ).fetchone()
         if row is None:
             raise GymError(f"unknown exercise: {name}")
@@ -1134,11 +1135,12 @@ class GymService:
             exercise = connection.execute(
                 """SELECT e.id,e.canonical_name,e.equipment_type,e.default_unit
                 FROM exercises e LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-                AND (a.owner_id IS NULL OR a.owner_id=?)
-                WHERE e.active=1 AND (e.owner_id IS NULL OR e.owner_id=?) AND (
-                 e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
-                ORDER BY e.owner_id IS NULL,e.id LIMIT 1""",
-                (owner_id, owner_id, name, name),
+                AND a.alias=? COLLATE NOCASE AND (a.owner_id IS NULL OR a.owner_id=?)
+                WHERE e.active=1 AND (e.owner_id IS NULL OR e.owner_id=?)
+                AND (e.canonical_name=? COLLATE NOCASE OR a.id IS NOT NULL)
+                ORDER BY e.canonical_name<>? COLLATE NOCASE,e.owner_id IS NULL,a.owner_id IS NULL,
+                e.id LIMIT 1""",
+                (name, owner_id, owner_id, name, name),
             ).fetchone()
             if exercise is None:
                 raise GymError(f"unknown exercise: {name}")
@@ -1464,19 +1466,17 @@ class GymService:
     def _active_workout_exercise(
         self, connection: sqlite3.Connection, owner_id: int, name: str
     ) -> sqlite3.Row:
+        exercise_id = self._exercise_id(connection, name, owner_id)
         row = connection.execute(
             """SELECT wx.id,wx.exercise_id,e.canonical_name
             FROM workout_exercises wx JOIN workout_sessions ws
             ON ws.id=wx.workout_session_id JOIN exercises e ON e.id=wx.exercise_id
-            LEFT JOIN exercise_aliases a ON a.exercise_id=e.id
-            AND (a.owner_id IS NULL OR a.owner_id=?)
             WHERE ws.user_id=? AND ws.status='active' AND (e.owner_id IS NULL OR e.owner_id=?)
-            AND (e.canonical_name=? COLLATE NOCASE OR a.alias=? COLLATE NOCASE)
-            ORDER BY e.canonical_name<>? COLLATE NOCASE,wx.sequence LIMIT 1""",
-            (owner_id, owner_id, owner_id, name, name, name),
+            AND (wx.exercise_id=? OR e.canonical_name=? COLLATE NOCASE)
+            ORDER BY wx.exercise_id<>?,wx.sequence LIMIT 1""",
+            (owner_id, owner_id, exercise_id, name, exercise_id),
         ).fetchone()
         if row is None:
-            self._exercise_id(connection, name, owner_id)
             raise GymError("exercise is not prescribed in the active workout")
         return cast("sqlite3.Row", row)
 

@@ -146,3 +146,47 @@ def test_legacy_catalog_migration_preserves_ids_loads_and_aliases(tmp_path: Path
         assert not connection.execute("PRAGMA foreign_key_check").fetchall()
         assert connection.execute("SELECT id FROM exercise_aliases").fetchone()[0] == 9
         assert connection.execute("SELECT exercise_id FROM workout_exercises").fetchone()[0] == 7
+
+
+def test_matching_private_alias_takes_precedence_for_plain_and_scheduled_results(
+    tmp_path: Path,
+) -> None:
+    service = GymService(Database(tmp_path / "catalog.sqlite3"))
+    shared_push = service.add_exercise(
+        "shared push", Category.PUSH, Orientation.VERTICAL, "bodyweight"
+    )
+    shared_pull = service.add_exercise(
+        "shared pull", Category.PULL, Orientation.VERTICAL, "bodyweight"
+    )
+    service.add_alias("my move", "shared push")
+    service.add_alias("my move", "shared pull", owner_id=1)
+    service.add_alias("my other move", "my move", owner_id=1)
+    service.begin_workout(scheduled=True, now=NOW, owner_id=1)
+    service.begin_workout(scheduled=True, now=NOW, owner_id=2)
+    assert (
+        service.log_exercise("my move", Decimal(0), (5, 5, 5), final_rir=1, owner_id=1)["exercise"]
+        == "Shared Pull"
+    )
+    assert (
+        service.log_exercise("my move", Decimal(0), (5, 5, 5), final_rir=1, owner_id=2)["exercise"]
+        == "Shared Push"
+    )
+    assert service.performed_history(1)[0]["sets"][0]["exercise_id"] == shared_pull["id"]
+    assert service.performed_history(2)[0]["sets"][0]["exercise_id"] == shared_push["id"]
+    for day, alias in (("2026-11-24", "my move"), ("2026-11-25", "my other move")):
+        historical = service.log_bodyweight_workout("geoff", day, ((alias, (5, 5, 5), 1),))
+        assert historical["exercises"][0]["exercise"] == "Shared Pull"
+
+
+def test_private_alias_to_unprescribed_exercise_never_falls_back_to_shared_alias(
+    tmp_path: Path,
+) -> None:
+    service = GymService(Database(tmp_path / "catalog.sqlite3"))
+    service.add_exercise("scheduled move", Category.PUSH, Orientation.VERTICAL, "bodyweight")
+    service.add_exercise("other move", Category.PULL, Orientation.HORIZONTAL, "bodyweight")
+    service.add_alias("my move", "scheduled move")
+    service.add_alias("my move", "other move", owner_id=1)
+    service.begin_workout(scheduled=True, now=NOW, owner_id=1)
+    with pytest.raises(GymError, match="not prescribed"):
+        service.log_exercise("my move", Decimal(0), (5, 5, 5), final_rir=1, owner_id=1)
+    assert service.performed_history(1) == []
