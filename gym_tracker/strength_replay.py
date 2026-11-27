@@ -131,6 +131,39 @@ def correct_exercise_date_with_replay(
     )
 
 
+def correct_workout_date_with_replay(
+    service: GymService,
+    owner_id: int,
+    target: PerformedWorkout,
+    local_date: date,
+    client_key: str,
+    request_id: UUID,
+    *,
+    time_zone: ZoneInfo,
+    now: datetime | None = None,
+) -> RecordedResponse:
+    """Correct an entire performed workout by its current revision set."""
+    canonical = (asdict(target), local_date.isoformat())
+    write = partial(
+        service.correct_performed_workout_date,
+        owner_id=owner_id,
+        target=target,
+        local_date=local_date,
+        time_zone=time_zone,
+        now=now,
+    )
+    return _commit_strength_write(
+        service,
+        owner_id,
+        "correct_workout_date",
+        client_key,
+        request_id,
+        canonical,
+        write,
+        audit_outcome="corrected",
+    )
+
+
 @dataclass(frozen=True)
 class DeletionPreview:
     target: PerformedExercise
@@ -208,7 +241,7 @@ class StrengthDeletion:
         *,
         now: datetime,
     ) -> WorkoutDeletionPreview:
-        target = service.preview_workout_deletion(owner_id, workout_id)
+        target = service.performed_workout_reference(owner_id, workout_id)
         expires_at = int(now.timestamp()) + 600
         return WorkoutDeletionPreview(
             target, f"{expires_at}.{self._signature(owner_id, target, expires_at)}"

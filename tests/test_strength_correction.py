@@ -15,6 +15,7 @@ from gym_tracker.domain import Category, Orientation
 from gym_tracker.service import (
     GymError,
     GymService,
+    PriorStrengthResult,
     ScheduledStrengthResult,
     StrengthDateCorrection,
     WorkoutRecordNotFound,
@@ -23,6 +24,8 @@ from gym_tracker.service import (
 from gym_tracker.strength_replay import (
     IdempotencyKeyReused,
     correct_exercise_date_with_replay,
+    correct_workout_date_with_replay,
+    record_prior_workout_with_replay,
     record_with_replay,
 )
 
@@ -143,4 +146,58 @@ def test_stale_and_foreign_date_corrections_are_denied(
         )
     (workout,) = service.performed_history(1)
     assert workout["local_date"] == "2026-11-21"
+    assert service.performed_history(2) == []
+
+
+def test_atomic_workout_date_correction_keeps_every_set_and_rechecks_all_revisions(
+    service: GymService,
+) -> None:
+    result = []
+    for category in (Category.PUSH, Category.PULL):
+        exercise = service.add_exercise(
+            f"fixture {category}",
+            category,
+            Orientation.VERTICAL,
+            "bodyweight",
+            owner_id=1,
+        )
+        result.append(PriorStrengthResult(exercise["id"], (Decimal(0),) * 3, (5, 5, 5), "lb", 1))
+    logged = record_prior_workout_with_replay(
+        service, 1, EARLIER, tuple(result), "prior", uuid4(), time_zone=LONDON, now=NOW
+    )
+    workout_id = json.loads(logged.body)["workout_id"]
+    with pytest.raises(WorkoutRecordNotFound):
+        service.performed_workout_reference(2, workout_id)
+    original = service.performed_workout_reference(1, workout_id)
+    old_sets = {row["set_id"] for row in service.performed_history(1)[0]["sets"]}
+
+    first = original.results[0]
+    correction = StrengthDateCorrection(
+        workout_id, first.prescription_id, first.result_revision, date(2026, 11, 21)
+    )
+    correct_exercise_date_with_replay(
+        service, 1, correction, "partial", uuid4(), time_zone=LONDON, now=NOW
+    )
+    corrected_date = date(2026, 11, 18)
+    with pytest.raises(WorkoutStateConflict, match="workout results have changed"):
+        correct_workout_date_with_replay(
+            service, 1, original, corrected_date, "whole", uuid4(), time_zone=LONDON, now=NOW
+        )
+    assert {row["performed_local_date"] for row in service.performed_history(1)[0]["sets"]} == {
+        "2026-11-20",
+        "2026-11-21",
+    }
+    current = service.performed_workout_reference(1, workout_id)
+    corrected = correct_workout_date_with_replay(
+        service, 1, current, corrected_date, "whole", uuid4(), time_zone=LONDON, now=NOW
+    )
+    assert (
+        correct_workout_date_with_replay(
+            service, 1, current, corrected_date, "whole", uuid4(), time_zone=LONDON, now=NOW
+        )
+        == corrected
+    )
+    (history,) = service.performed_history(1, from_date=corrected_date, through_date=corrected_date)
+    assert {row["set_id"] for row in history["sets"]} == old_sets
+    assert {row["performed_local_date"] for row in history["sets"]} == {"2026-11-18"}
     assert service.performed_history(2) == []
