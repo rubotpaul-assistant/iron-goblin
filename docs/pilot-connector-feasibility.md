@@ -50,3 +50,26 @@ privileged supported distribution route and keep product endpoints invite-gated.
 The reachable fixture, registration, any public listing and the actual
 connection runs require separate approval. [Iron's hosted work order](https://github.com/rubotpaul-assistant/iron-goblin/issues/6)
 tracks the release gate, and #24 tracks Iron's own staging acceptance.
+
+## Loopback transport rehearsal
+
+Start the disposable MCP fixture from the repository root. Supply a fresh
+synthetic bearer value of at least 32 characters through
+`IRON_CONNECTOR_FIXTURE_TOKEN` and choose a new temporary database path.
+
+```sh
+uv run python -m gym_tracker.connector_fixture --database /tmp/iron-connector-rehearsal.sqlite3
+```
+
+The fixture binds to `http://127.0.0.1:8765`, serves readiness at `/healthz`
+and accepts stateless MCP POST requests at `/mcp`. It seeds a single synthetic
+prescription. Tests cover initialization, discovery, denied credentials,
+one recorded result, identical replay and a history read with three sets.
+
+```sh
+uv run pytest -q -x --no-cov tests/test_connector_fixture.py
+```
+
+The loopback bearer exercises transport and record behavior. The real
+client discovery, OAuth and permission flows remain part of the approved
+reachable fixture trial.
