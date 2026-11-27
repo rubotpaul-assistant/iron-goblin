@@ -47,6 +47,15 @@ class TracerAccessDenied(Exception):
     """Public denial code with no credential, grant, or account details."""
 
 
+class TracerContext(Protocol):
+    @property
+    def service(self) -> GymService: ...
+
+    def now(self) -> datetime: ...
+
+    def context(self, token: str | None, scope: WorkoutScope) -> tuple[int, ZoneInfo]: ...
+
+
 class PrivateTracer:
     """Use an explicit fixture database and server-controlled owner binding."""
 
@@ -72,6 +81,9 @@ class PrivateTracer:
 
     def now(self) -> datetime:
         return self._clock()
+
+    def context(self, token: str | None, scope: WorkoutScope) -> tuple[int, ZoneInfo]:
+        return self.authorize(token, scope), self.time_zone
 
     def authorize(self, token: str | None, scope: WorkoutScope) -> int:
         """Authorize each request before looking up domain records or replay receipts."""

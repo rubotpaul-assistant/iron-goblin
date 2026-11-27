@@ -18,7 +18,7 @@ from gym_tracker.service import (
     WorkoutStateConflict,
 )
 from gym_tracker.strength_replay import IdempotencyKeyReused, RecordedResponse, record_with_replay
-from gym_tracker.tracer_auth import PrivateTracer, TracerAccessDenied, WorkoutScope
+from gym_tracker.tracer_auth import TracerAccessDenied, TracerContext, WorkoutScope
 
 WORKOUTS_PATH = "/v1/iron-goblin/workouts"
 RESULT_PATH = re.compile(WORKOUTS_PATH + r"/([1-9][0-9]{0,18})/exercise-results")
@@ -51,7 +51,7 @@ class InvalidHistoryRange(Exception):
 class TracerHTTP:
     """Serve the three private operations using an explicitly supplied tracer."""
 
-    def __init__(self, tracer: PrivateTracer) -> None:
+    def __init__(self, tracer: TracerContext) -> None:
         self._tracer = tracer
 
     def __call__(self, environ: WSGIEnvironment, start_response: StartResponse) -> list[bytes]:
@@ -73,7 +73,7 @@ class TracerHTTP:
         if route is None:
             return _error(404, "WORKOUT_OR_PRESCRIPTION_NOT_FOUND")
         try:
-            owner_id = self._tracer.authorize(_bearer(environ), route.scope)
+            owner_id, time_zone = self._tracer.context(_bearer(environ), route.scope)
             service = self._tracer.service
             if route.workout_id is not None:
                 return record_with_replay(
@@ -83,11 +83,11 @@ class TracerHTTP:
                     environ.get("HTTP_IDEMPOTENCY_KEY", ""),
                     uuid4(),
                     now=self._tracer.now(),
-                    time_zone=self._tracer.time_zone,
+                    time_zone=time_zone,
                 )
             if path == f"{WORKOUTS_PATH}/active":
                 return _json_response(200, {"workout": service.active_scheduled_workout(owner_id)})
-            today = self._tracer.now().astimezone(self._tracer.time_zone).date()
+            today = self._tracer.now().astimezone(time_zone).date()
             start, end = _history_dates(environ.get("QUERY_STRING", ""), today)
             return _json_response(
                 200,

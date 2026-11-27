@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!gym_tracker/
+!gym_tracker/*.py
+!contracts/
+!contracts/iron-tracer-openapi.json

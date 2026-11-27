@@ -4,11 +4,14 @@ import json
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode
+from wsgiref.types import WSGIEnvironment
+from wsgiref.util import setup_testing_defaults
 
 from gym_tracker.strength_replay import RecordedResponse
-from gym_tracker.tracer_http import MAX_SQLITE_INTEGER, WORKOUTS_PATH
+from gym_tracker.tracer_http import MAX_SQLITE_INTEGER, WORKOUTS_PATH, TracerHTTP
 
 PROTOCOL_VERSION = "2025-11-25"
 ACTIVE_TOOL = "iron_goblin_get_active_workout"
@@ -26,6 +29,36 @@ class TracerRequest:
     idempotency_key: str | None = None
 
 
+def forward_wsgi(http: TracerHTTP, request: TracerRequest) -> RecordedResponse:
+    environment: WSGIEnvironment = {}
+    setup_testing_defaults(environment)
+    path, _, query = request.path.partition("?")
+    payload = json.dumps(request.body).encode() if request.body is not None else b""
+    environment.update(
+        REQUEST_METHOD=request.method,
+        PATH_INFO=path,
+        QUERY_STRING=query,
+        CONTENT_TYPE="application/json",
+        CONTENT_LENGTH=str(len(payload)),
+    )
+    environment["wsgi.input"] = BytesIO(payload)
+    if request.authorization is not None:
+        environment["HTTP_AUTHORIZATION"] = request.authorization
+    if request.idempotency_key is not None:
+        environment["HTTP_IDEMPOTENCY_KEY"] = request.idempotency_key
+    statuses: list[int] = []
+    parts: list[bytes] = []
+
+    def capture(
+        status: str, _headers: list[tuple[str, str]], _error: Any = None, /
+    ) -> Callable[[bytes], object]:
+        statuses.append(int(status.split()[0]))
+        return parts.append
+
+    parts.extend(http(environment, capture))
+    return RecordedResponse(statuses[0], b"".join(parts).decode())
+
+
 class TracerMCP:
     """Dispatch local JSON-RPC messages and forward authorized tool calls to HTTP."""
 
@@ -33,7 +66,7 @@ class TracerMCP:
         self, send_http: Callable[[TracerRequest], RecordedResponse], openapi: dict[str, Any]
     ) -> None:
         self._send_http = send_http
-        self._tools = _make_tools(openapi)
+        self._tools = make_tools(openapi)
 
     def dispatch(
         self, request: dict[str, Any], *, authorization: str | None = None
@@ -109,7 +142,7 @@ class TracerMCP:
         }
 
 
-def _make_tools(openapi: dict[str, Any]) -> list[dict[str, Any]]:
+def make_tools(openapi: dict[str, Any]) -> list[dict[str, Any]]:
     schemas = openapi["components"]["schemas"]
     post = openapi["paths"][f"{WORKOUTS_PATH}/{{workoutId}}/exercise-results"]["post"]
     parameters = {parameter["name"]: parameter["schema"] for parameter in post["parameters"]}
