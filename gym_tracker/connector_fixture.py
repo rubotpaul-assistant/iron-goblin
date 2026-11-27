@@ -3,23 +3,19 @@
 import argparse
 import json
 import os
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http import HTTPStatus
-from io import BytesIO
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 from wsgiref.types import StartResponse, WSGIEnvironment
-from wsgiref.util import setup_testing_defaults
 
 from gym_tracker.domain import Category, Orientation
-from gym_tracker.strength_replay import RecordedResponse
 from gym_tracker.tracer_auth import PrivateTracer, TracerBinding, VerifiedGrant, WorkoutScope
 from gym_tracker.tracer_http import TracerHTTP
-from gym_tracker.tracer_mcp import PROTOCOL_VERSION, TracerMCP, TracerRequest
+from gym_tracker.tracer_mcp import PROTOCOL_VERSION, TracerMCP, forward_wsgi
 
 MAX_MESSAGE_BYTES = 16_384
 
@@ -31,7 +27,7 @@ class ConnectorFixture:
         self, tracer: PrivateTracer, openapi: dict[str, Any], *, allowed_origin: str
     ) -> None:
         self._http = TracerHTTP(tracer)
-        self._mcp = TracerMCP(self._forward, openapi)
+        self._mcp = TracerMCP(lambda request: forward_wsgi(self._http, request), openapi)
         self._allowed_origin = allowed_origin
 
     def __call__(self, environ: WSGIEnvironment, start_response: StartResponse) -> list[bytes]:
@@ -77,35 +73,6 @@ class ConnectorFixture:
             return HTTPStatus.BAD_REQUEST, {"error": "INVALID_MESSAGE"}
         response = self._mcp.dispatch(request, authorization=environ.get("HTTP_AUTHORIZATION"))
         return (HTTPStatus.OK, response) if response is not None else (HTTPStatus.ACCEPTED, None)
-
-    def _forward(self, request: TracerRequest) -> RecordedResponse:
-        environment: WSGIEnvironment = {}
-        setup_testing_defaults(environment)
-        path, _, query = request.path.partition("?")
-        payload = json.dumps(request.body).encode() if request.body is not None else b""
-        environment.update(
-            REQUEST_METHOD=request.method,
-            PATH_INFO=path,
-            QUERY_STRING=query,
-            CONTENT_TYPE="application/json",
-            CONTENT_LENGTH=str(len(payload)),
-        )
-        environment["wsgi.input"] = BytesIO(payload)
-        if request.authorization is not None:
-            environment["HTTP_AUTHORIZATION"] = request.authorization
-        if request.idempotency_key is not None:
-            environment["HTTP_IDEMPOTENCY_KEY"] = request.idempotency_key
-        statuses: list[int] = []
-        parts: list[bytes] = []
-
-        def capture(
-            status: str, _headers: list[tuple[str, str]], _error: Any = None, /
-        ) -> Callable[[bytes], object]:
-            statuses.append(int(status.split()[0]))
-            return parts.append
-
-        parts.extend(self._http(environment, capture))
-        return RecordedResponse(statuses[0], b"".join(parts).decode())
 
 
 def create_connector_fixture(
