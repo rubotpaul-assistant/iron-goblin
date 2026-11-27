@@ -32,9 +32,11 @@ Macro access and the shared identity while another product grant remains valid.
 For the deletion rehearsal, cover two accounts and both product grants.
 
 Record a protected deletion marker with the minimum information necessary
-to apply prior deletions on restore. Restore only into isolation, apply all
-deletion markers newer than the snapshot, verify both account and product
-isolation, and then consider returning the database to service. Document
+to apply prior deletions on restore. Store the expected database identity in
+the protected backup manifest before taking a snapshot. Restore into isolation,
+check the copy against that manifest, then apply all closure markers for that
+lineage. A snapshot that predates a verified lineage stays quarantined.
+Verify both account and product isolation before returning the database to service. Document
 the approved backup expiry and verify that no older copy is retained beyond it.
 The default recovery exercise uses
 [the local recovery runbook](pilot-hosting-recovery.md).

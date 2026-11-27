@@ -89,9 +89,9 @@ def test_iron_closure_and_restore_preserve_another_account_and_macro(tmp_path: P
     assert not any(export_iron_account(current.database, 1)["records"].values())
     assert len(GymService(restored).performed_history(1)[0]["sets"]) == 3
 
-    closure.apply_prior_closures(restored)
+    closure.apply_prior_closures(restored, expected_database_id=preview.database_id)
     closed = export_iron_account(restored, 1)
-    closure.apply_prior_closures(restored)
+    closure.apply_prior_closures(restored, expected_database_id=preview.database_id)
     assert export_iron_account(restored, 1) == closed
     assert not any(closed["records"].values())
     assert export_iron_account(restored, 2) == foreign_before
@@ -110,7 +110,7 @@ def test_closure_dry_run_is_read_only_and_detects_changed_counts(tmp_path: Path)
     service.begin_workout(scheduled=True, now=NOW)
     with pytest.raises(WorkoutStateConflict, match="changed since the dry run"):
         closure.confirm(database, invites, "fixture-verified-owner", preview, now=NOW)
-    closure.apply_prior_closures(database)
+    closure.apply_prior_closures(database, expected_database_id=preview.database_id)
     assert service.current_workout()["status"] == "active"
     with pytest.raises(ValueError, match="require a separate store"):
         closure.preview(
@@ -130,6 +130,30 @@ def test_different_database_with_same_owner_id_cannot_use_confirmation_or_marker
         closure.confirm(other.database, invites, "fixture-verified-owner", preview, now=NOW)
     closure.confirm(one.database, invites, "fixture-verified-owner", preview, now=NOW)
     foreign = export_iron_account(other.database, 1)
-    closure.apply_prior_closures(other.database)
+    with pytest.raises(WorkoutStateConflict, match="does not match verified lineage"):
+        closure.apply_prior_closures(other.database, expected_database_id=preview.database_id)
     assert export_iron_account(other.database, 1) == foreign
     assert other.show_user("geoff")["user"]["active"] == 1
+
+
+def test_legacy_snapshot_without_lineage_is_rejected_before_and_after_migration(
+    tmp_path: Path,
+) -> None:
+    live = GymService(Database(tmp_path / "live.sqlite3"))
+    backup = Database(tmp_path / "legacy-restore.sqlite3")
+    live.begin_workout(scheduled=True, now=NOW)
+    with live.database.connect() as source, backup.connect() as legacy:
+        source.backup(legacy)
+        legacy.execute("DROP TABLE iron_database_identity")
+
+    closure = IronSupportClosure(tmp_path / "closures.sqlite3", secrets.token_bytes(32))
+    invites = ProductInvites(tmp_path / "grants.sqlite3", secrets.token_bytes(32))
+    preview = closure.preview(live.database, 1, "fixture-verified-owner", now=NOW)
+    closure.confirm(live.database, invites, "fixture-verified-owner", preview, now=NOW)
+    with pytest.raises(WorkoutStateConflict, match="has no verified lineage"):
+        closure.apply_prior_closures(backup, expected_database_id=preview.database_id)
+
+    legacy = GymService(backup)
+    with pytest.raises(WorkoutStateConflict, match="does not match verified lineage"):
+        closure.apply_prior_closures(backup, expected_database_id=preview.database_id)
+    assert legacy.current_workout()["status"] == "active"

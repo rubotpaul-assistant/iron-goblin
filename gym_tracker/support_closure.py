@@ -140,17 +140,20 @@ class IronSupportClosure:
                 ).fetchone()[0]
             self._purge(connection, preview.owner_id, retired_slug)
 
-    def apply_prior_closures(self, restored_database: Database) -> None:
-        """Reapply confirmed closures before a restored copy is made available."""
+    def apply_prior_closures(
+        self, restored_database: Database, *, expected_database_id: str
+    ) -> None:
+        """Validate trusted backup lineage before reapplying confirmed closures."""
         self._require_separate_store(restored_database)
         with restored_database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            database_id = self._database_id(connection)
+            if self._database_id(connection) != expected_database_id:
+                raise WorkoutStateConflict("restored Iron database does not match verified lineage")
             with closing(sqlite3.connect(self._marker_store)) as journal:
                 markers = journal.execute(
                     """SELECT owner_id,retired_slug FROM iron_closures
                     WHERE database_id=? ORDER BY owner_id""",
-                    (database_id,),
+                    (expected_database_id,),
                 ).fetchall()
             for owner_id, retired_slug in markers:
                 self._purge(connection, int(owner_id), retired_slug)
@@ -172,11 +175,17 @@ class IronSupportClosure:
 
     @staticmethod
     def _database_id(connection: sqlite3.Connection) -> str:
-        return str(
-            connection.execute(
-                "SELECT database_id FROM iron_database_identity WHERE singleton=1"
-            ).fetchone()[0]
-        )
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='iron_database_identity'"
+        ).fetchone()
+        if table is None:
+            raise WorkoutStateConflict("Iron database has no verified lineage")
+        row = connection.execute(
+            "SELECT database_id FROM iron_database_identity WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise WorkoutStateConflict("Iron database has no verified lineage")
+        return str(row[0])
 
     @staticmethod
     def _counts(connection: sqlite3.Connection, owner_id: int) -> tuple[tuple[str, int], ...]:
