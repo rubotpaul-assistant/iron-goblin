@@ -53,6 +53,11 @@ CREATE TABLE IF NOT EXISTS sets (
 
 SCHEMA = f"""
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS iron_database_identity (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), database_id TEXT NOT NULL
+);
+INSERT OR IGNORE INTO iron_database_identity(singleton,database_id)
+ VALUES(1,lower(hex(randomblob(16))));
 CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
  display_name TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
