@@ -10,6 +10,12 @@ skill translates conversation into structured CLI calls; it never calculates or 
 The companion `iron-goblin` OpenClaw skill is managed through Skill Workshop rather than installed
 from this repository.
 
+Iron Goblin also contains an authenticated private HTTP tracer, an MCP adapter, fixture account
+and invite controls, governed correction/deletion workflows, support export and account-closure
+rehearsals, and a loopback connector fixture. These are pilot building blocks, not a hosted
+production service. See [Launch readiness](docs/launch-readiness.md) for the current evidence,
+remaining gates, and launch recommendation.
+
 ## Development
 
 ```bash
