@@ -1287,6 +1287,50 @@ class GymService:
             "result_revision": correction.expected_revision + 1,
         }
 
+    def correct_performed_workout_date(
+        self,
+        connection: sqlite3.Connection,
+        owner_id: int,
+        target: PerformedWorkout,
+        local_date: date,
+        *,
+        time_zone: ZoneInfo,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Correct all current performed results for one owned workout atomically."""
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        if self._owned_performed_workout(connection, owner_id, target.workout_id) != target:
+            raise WorkoutStateConflict("workout results have changed")
+        timestamp = now or datetime.now(UTC)
+        corrected = [
+            self.correct_performed_exercise_date(
+                connection,
+                owner_id,
+                StrengthDateCorrection(
+                    exercise.workout_id,
+                    exercise.prescription_id,
+                    exercise.result_revision,
+                    local_date,
+                ),
+                time_zone=time_zone,
+                now=timestamp,
+            )
+            for exercise in target.results
+        ]
+        return {
+            "ok": True,
+            "workout_id": target.workout_id,
+            "performed_local_date": local_date.isoformat(),
+            "exercises": [
+                {
+                    "prescription_id": row["prescription_id"],
+                    "result_revision": row["result_revision"],
+                }
+                for row in corrected
+            ],
+        }
+
     def preview_exercise_deletion(
         self, owner_id: int, workout_id: int, prescription_id: int
     ) -> PerformedExercise:
@@ -1349,8 +1393,8 @@ class GymService:
             "deleted": True,
         }
 
-    def preview_workout_deletion(self, owner_id: int, workout_id: int) -> PerformedWorkout:
-        """Read the current owned result revisions for a whole-workout confirmation."""
+    def performed_workout_reference(self, owner_id: int, workout_id: int) -> PerformedWorkout:
+        """Read the current owned result revisions for a whole-workout operation."""
         with self.database.connect() as connection:
             return self._owned_performed_workout(connection, owner_id, workout_id)
 
